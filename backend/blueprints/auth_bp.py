@@ -8,6 +8,7 @@ from utils.auth_utils import (
 )
 from utils.db import get_db_connection
 from utils.helpers import limpiar_texto
+from utils.limiter import limiter
 from utils.user_utils import (
     actualizar_ultimo_acceso,
     obtener_usuario_por_id,
@@ -18,6 +19,7 @@ auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 
 
 @auth_bp.route("/login", methods=["POST"])
+@limiter.limit("60 per minute; 200 per hour")
 def login():
     data = request.get_json()
     if not data:

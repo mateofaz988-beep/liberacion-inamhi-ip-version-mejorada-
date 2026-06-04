@@ -1,6 +1,10 @@
+import logging
+
 from mysql.connector import Error
 
 from utils.db import get_db_connection
+
+log = logging.getLogger("inamhi")
 
 _SQL_USUARIO_BASE = """
     SELECT
@@ -23,7 +27,7 @@ def obtener_usuario_por_username(username: str) -> dict | None:
         cursor.execute(_SQL_USUARIO_BASE + " WHERE u.usuario = %s LIMIT 1", (username,))
         return cursor.fetchone()
     except Error as e:
-        print(f"[user] error obtener_usuario_por_username: {e}")
+        log.error("[user] error obtener_usuario_por_username: %s", e)
         return None
     finally:
         try:
@@ -47,7 +51,7 @@ def obtener_usuario_por_id(usuario_id: int) -> dict | None:
         )
         return cursor.fetchone()
     except Error as e:
-        print(f"[user] error obtener_usuario_por_id: {e}")
+        log.error("[user] error obtener_usuario_por_id: %s", e)
         return None
     finally:
         try:
@@ -67,7 +71,7 @@ def actualizar_ultimo_acceso(usuario_id: int) -> bool:
         conexion.commit()
         return True
     except Error as e:
-        print(f"[user] error actualizar_ultimo_acceso: {e}")
+        log.error("[user] error actualizar_ultimo_acceso: %s", e)
         return False
     finally:
         try:

@@ -602,11 +602,18 @@
               [(ngModel)]="passwordCertificado"
               [disabled]="firmandoDocumento || validandoCertificado"
               autocomplete="current-password"
+              (keyup)="detectarCapsLock($event)"
+              (keydown)="detectarCapsLock($event)"
             />
             <button type="button" class="mfd-eye" (click)="toggleMostrarPassword()">
               <i class="bi" [ngClass]="mostrarPassword ? 'bi-eye-slash-fill' : 'bi-eye-fill'"></i>
             </button>
           </div>
+          @if (capsLockActivo && !mostrarPassword) {
+            <p class="mfd-caps-warn">
+              <i class="bi bi-capslock-fill"></i> Bloq Mayús activado — verifique que su contraseña esté en el formato correcto.
+            </p>
+          }
           <p class="mfd-hint">La contraseña no se almacena ni se registra en el sistema.</p>
         </div>
 

@@ -42,3 +42,19 @@ __screenshots__/
 # System files
 .DS_Store
 Thumbs.db
+
+# Variables de entorno — nunca commitear credenciales
+.env
+backend/.env
+*.env
+!.env.example
+!backend/.env.example
+
+# Python
+backend/__pycache__/
+backend/*.pyc
+backend/*.pyo
+backend/uploads/
+
+# Logs
+backend/logs/

@@ -83,12 +83,30 @@ export class AuthService {
     return localStorage.getItem(this.ROL_KEY);
   }
 
+  isTokenExpired(): boolean {
+    const token = this.getToken();
+    if (!token) return true;
+    try {
+      const payload = JSON.parse(atob(token.split('.')[1]));
+      return payload.exp * 1000 < Date.now();
+    } catch {
+      return true;
+    }
+  }
+
   isAuthenticated(): boolean {
     const token = this.getToken();
     const usuario = this.getUsuario();
     const rol = this.getRol();
 
-    return !!token && !!usuario && !!rol;
+    if (!token || !usuario || !rol) return false;
+
+    if (this.isTokenExpired()) {
+      this.logout();
+      return false;
+    }
+
+    return true;
   }
 
   isAdmin(): boolean {

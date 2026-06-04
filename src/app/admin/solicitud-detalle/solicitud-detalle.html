@@ -848,6 +848,8 @@
                       [disabled]="firmandoConCertificado"
                       autocomplete="current-password"
                       (input)="pasoFirma = passwordCertificado.length >= 1 ? 3 : 2"
+                      (keyup)="detectarCapsLock($event)"
+                      (keydown)="detectarCapsLock($event)"
                     />
                     <button
                       type="button"
@@ -858,6 +860,11 @@
                       <i class="bi" [ngClass]="mostrarPassword ? 'bi-eye-slash-fill' : 'bi-eye-fill'"></i>
                     </button>
                   </div>
+                  @if (capsLockActivo && !mostrarPassword) {
+                    <p class="fd-caps-warn">
+                      <i class="bi bi-capslock-fill"></i> Bloq Mayús activado — verifique que su contraseña esté en el formato correcto.
+                    </p>
+                  }
                   <p class="fd-hint">
                     <i class="bi bi-shield-lock" style="color:#10b981"></i>
                     La contraseña nunca se almacena — se usa solo para desbloquear el certificado en memoria.

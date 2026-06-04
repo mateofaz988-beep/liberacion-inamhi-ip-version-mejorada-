@@ -87,6 +87,7 @@ export class SolicitudDetalle implements OnInit {
   nombreCertificado = '';
   passwordCertificado = '';
   mostrarPassword = false;
+  capsLockActivo = false;
   observacionFirma = '';
   validandoCertificado = false;
   firmandoConCertificado = false;
@@ -1384,6 +1385,10 @@ export class SolicitudDetalle implements OnInit {
 
   toggleMostrarPassword(): void {
     this.mostrarPassword = !this.mostrarPassword;
+  }
+
+  detectarCapsLock(event: KeyboardEvent): void {
+    this.capsLockActivo = event.getModifierState('CapsLock');
   }
 
   // =====================================================

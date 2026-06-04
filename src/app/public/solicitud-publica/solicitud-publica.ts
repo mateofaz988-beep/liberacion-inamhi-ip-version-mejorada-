@@ -136,6 +136,7 @@ export class SolicitudPublica implements OnInit {
   nombreCertificadoPublico = '';
   passwordCertificado      = '';
   mostrarPassword          = false;
+  capsLockActivo           = false;
   observacionFirma         = '';
   validandoCertificado     = false;
   firmandoDocumento        = false;
@@ -692,6 +693,10 @@ export class SolicitudPublica implements OnInit {
 
   toggleMostrarPassword(): void {
     this.mostrarPassword = !this.mostrarPassword;
+  }
+
+  detectarCapsLock(event: KeyboardEvent): void {
+    this.capsLockActivo = event.getModifierState('CapsLock');
   }
 
   // =====================================================

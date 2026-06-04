@@ -75,3 +75,20 @@ def obtener_ip_cliente() -> str:
     if forwarded:
         return forwarded.split(",")[0].strip()
     return request.remote_addr or "0.0.0.0"
+
+
+# =====================================================
+# Seguridad de rutas de archivo
+# =====================================================
+
+def validar_ruta_segura(ruta: str, carpeta_base: str) -> str | None:
+    """
+    Verifica que `ruta` esté dentro de `carpeta_base` para prevenir path traversal.
+    Retorna la ruta absoluta normalizada si es segura, None si no lo es.
+    """
+    import os
+    ruta_abs = os.path.abspath(ruta)
+    base_abs = os.path.abspath(carpeta_base)
+    if ruta_abs.startswith(base_abs + os.sep) or ruta_abs == base_abs:
+        return ruta_abs
+    return None

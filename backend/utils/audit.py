@@ -1,9 +1,12 @@
 import json
+import logging
 
 from mysql.connector import Error
 
 from utils.db import get_db_connection
 from utils.helpers import obtener_ip_cliente
+
+log = logging.getLogger("inamhi")
 
 # =====================================================
 # Registro de auditoría general
@@ -28,7 +31,7 @@ def registrar_auditoria(
             """
             INSERT INTO auditoria
                 (usuario_id, solicitud_id, modulo, accion, descripcion,
-                 datos_anteriores, datos_nuevos, ip_cliente)
+                 datos_anteriores, datos_nuevos, ip_origen)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
@@ -37,14 +40,14 @@ def registrar_auditoria(
                 modulo,
                 accion,
                 descripcion,
-                json.dumps(datos_anteriores) if datos_anteriores else None,
-                json.dumps(datos_nuevos) if datos_nuevos else None,
+                json.dumps(datos_anteriores, ensure_ascii=False) if datos_anteriores else None,
+                json.dumps(datos_nuevos, ensure_ascii=False) if datos_nuevos else None,
                 obtener_ip_cliente(),
             ),
         )
         conexion.commit()
     except Error as e:
-        print(f"[audit] error al registrar auditoría: {e}")
+        log.error("[audit] error al registrar auditoría: %s", e)
     finally:
         try:
             cursor.close()

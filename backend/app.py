@@ -1,4 +1,4 @@
-from io import BytesIO
+﻿from io import BytesIO
 import json
 import uuid
 import smtplib
@@ -54,6 +54,8 @@ try:
     from cryptography.hazmat.primitives import hashes
     from pyhanko.sign import signers, fields
     from pyhanko.sign.fields import SigFieldSpec
+    from pyhanko.stamp import QRStampStyle, QRPosition
+    from pyhanko.stamp.text import TextBoxStyle
     from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
     from pyhanko.sign.signers.pdf_signer import PdfSignatureMetadata
     from pyhanko.sign.general import SigningError
@@ -69,7 +71,7 @@ try:
 except ImportError:
     PYHANKO_DISPONIBLE = False
     SigningError = Exception
-    print("ADVERTENCIA: pyHanko no está instalado. Instale con: pip install pyhanko pyhanko-certvalidator cryptography")
+    log.error("ADVERTENCIA: pyHanko no está instalado. Instale con: pip install pyhanko pyhanko-certvalidator cryptography")
 
 # =====================================================
 # qrcode — generación de QR para verificación pública
@@ -111,8 +113,10 @@ from utils.helpers import (
     validar_solo_letras_espacios, validar_correo_general,
     validar_cedula_formato, validar_telefono_10_digitos,
     validar_ipv4, validar_url, validar_fecha, convertir_fecha,
+    validar_ruta_segura,
 )
 from utils.audit import registrar_auditoria
+from utils.logger import log
 from utils.user_utils import (
     obtener_usuario_por_username, obtener_usuario_por_id, actualizar_ultimo_acceso,
 )
@@ -185,7 +189,7 @@ def enviar_correo(destinatario, asunto, cuerpo, cuerpo_html=None):
     servidor.sendmail(SMTP_USER, [destinatario], mensaje.as_string())
     servidor.quit()
 
-    print(f"correo enviado correctamente a {destinatario}")
+    log.info(f"correo enviado correctamente a {destinatario}")
     return True
 
 
@@ -196,7 +200,7 @@ def enviar_correo(destinatario, asunto, cuerpo, cuerpo_html=None):
 app = Flask(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-LOGO_INAMHI_PATH = os.path.join(BASE_DIR, "static", "img", "logo_inamhi.png")
+# LOGO_INAMHI_PATH ya viene de config.py (lee LOGO_PDF del .env)
 
 CORS(app, resources={
     r"/api/*": {
@@ -211,6 +215,14 @@ CORS(app, resources={
 # =====================================================
 from blueprints.auth_bp import auth_bp
 app.register_blueprint(auth_bp)
+
+@app.errorhandler(Exception)
+def _manejar_error_global(e):
+    import traceback
+    tb = traceback.format_exc()
+    print(f"\n{'='*60}\n[ERROR GLOBAL] {type(e).__name__}: {e}\n{tb}{'='*60}\n")
+    log.error("[ERROR GLOBAL] %s: %s\n%s", type(e).__name__, e, tb)
+    return jsonify({"estado": "error", "mensaje": f"{type(e).__name__}: {str(e)}"}), 500
 
 # =====================================================
 # permitir preflight CORS global sin token
@@ -232,6 +244,9 @@ def manejar_preflight_cors():
         return respuesta, 200
 
 app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024  # 15 MB
+
+from utils.limiter import limiter as _limiter
+_limiter.init_app(app)
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = int(os.getenv("DB_PORT", 3306))
@@ -272,167 +287,36 @@ app.config["ESCANEADOS_FOLDER"] = ESCANEADOS_FOLDER
 app.config["TEMP_CERTS_FOLDER"] = TEMP_CERTS_FOLDER
 
 
-# get_db_connection, limpiar_texto, normalizar_espacios, obtener_ip_cliente
-# ya importados desde utils/ — no se redefinen aquí
+# Todas las funciones de validación y utilidades están en utils/helpers.py
+# y se importan al inicio del archivo.
 
 
-def validar_solo_letras_espacios(texto):
-    patron = r"^[a-zA-ZáéíóúÁÉÍÓÚñÑüÜ\s]+$"
-    return re.match(patron, texto) is not None
-
-
-def validar_correo_general(correo):
-    correo = limpiar_texto(correo).lower()
-
-    patron_correo = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
-
-    return re.match(patron_correo, correo) is not None
-
-
-def validar_cedula_formato(cedula):
-    cedula = limpiar_texto(cedula)
-    return cedula.isdigit() and len(cedula) == 10
-
-
-def validar_telefono_10_digitos(telefono):
-    telefono = limpiar_texto(telefono)
-    return telefono.isdigit() and len(telefono) == 10
-
-
-def validar_ipv4(ip):
-    ip = limpiar_texto(ip)
-
-    try:
-        ipaddress.IPv4Address(ip)
-        return True
-    except Exception:
-        return False
-
-
-def validar_url(url):
-    url = limpiar_texto(url)
-
-    if not url:
-        return False
-
-    if " " in url:
-        return False
-
-    try:
-        resultado = urlparse(url)
-
-        if resultado.scheme not in ["http", "https"]:
-            return False
-
-        if not resultado.netloc:
-            return False
-
-        return True
-
-    except Exception:
-        return False
-
-
-def validar_fecha(fecha):
-    fecha = limpiar_texto(fecha)
-
-    try:
-        datetime.datetime.strptime(fecha, "%Y-%m-%d")
-        return True
-    except ValueError:
-        return False
-
-
-def convertir_fecha(fecha):
-    return datetime.datetime.strptime(fecha, "%Y-%m-%d").date()
-
-
-def generar_codigo_solicitud():
+def generar_codigo_solicitud() -> str | None:
     anio = datetime.datetime.now().year
     prefijo = f"INAMHI-WEB-{anio}-"
-
     conexion = get_db_connection()
-
     if conexion is None:
         return None
-
+    cursor = None
     try:
         cursor = conexion.cursor(dictionary=True)
-
-        sql = """
-            select codigo_solicitud
-            from solicitudes
-            where codigo_solicitud like %s
-            order by id desc
-            limit 1;
-        """
-
-        cursor.execute(sql, (f"{prefijo}%",))
+        cursor.execute(
+            "select codigo_solicitud from solicitudes where codigo_solicitud like %s order by id desc limit 1;",
+            (f"{prefijo}%",)
+        )
         ultimo = cursor.fetchone()
-
-        cursor.close()
-        conexion.close()
-
         if ultimo is None:
             numero = 1
         else:
-            codigo_actual = ultimo["codigo_solicitud"]
-            numero_actual = int(codigo_actual.split("-")[-1])
-            numero = numero_actual + 1
-
+            numero = int(ultimo["codigo_solicitud"].split("-")[-1]) + 1
         return f"{prefijo}{str(numero).zfill(4)}"
-
     except Exception as error:
-        print("error al generar código:", error)
+        log.error("error al generar código: %s", error)
         return None
-
-
-def registrar_auditoria(usuario_id, solicitud_id, modulo, accion, descripcion, datos_anteriores=None, datos_nuevos=None):
-    conexion = get_db_connection()
-
-    if conexion is None:
-        return False
-
-    try:
-        cursor = conexion.cursor()
-
-        sql = """
-            insert into auditoria (
-                usuario_id,
-                solicitud_id,
-                modulo,
-                accion,
-                descripcion,
-                datos_anteriores,
-                datos_nuevos,
-                ip_origen
-            ) values (
-                %s, %s, %s, %s, %s, %s, %s, %s
-            );
-        """
-
-        import json
-
-        cursor.execute(sql, (
-            usuario_id,
-            solicitud_id,
-            modulo,
-            accion,
-            descripcion,
-            json.dumps(datos_anteriores, ensure_ascii=False) if datos_anteriores else None,
-            json.dumps(datos_nuevos, ensure_ascii=False) if datos_nuevos else None,
-            obtener_ip_cliente()
-        ))
-
-        conexion.commit()
-        cursor.close()
+    finally:
+        if cursor:
+            cursor.close()
         conexion.close()
-
-        return True
-
-    except Error as error:
-        print("error al registrar auditoría:", error)
-        return False
 
 
 # =====================================================
@@ -673,7 +557,7 @@ def obtener_usuario_por_username(username):
         return usuario
 
     except Error as error:
-        print("error al obtener usuario:", error)
+        log.error("error al obtener usuario:: %s", error)
         return None
 
 
@@ -719,7 +603,7 @@ def obtener_usuario_por_id(usuario_id):
         return usuario
 
     except Error as error:
-        print("error al obtener usuario por id:", error)
+        log.error("error al obtener usuario por id:: %s", error)
         return None
 
 
@@ -747,7 +631,7 @@ def actualizar_ultimo_acceso(usuario_id):
         return True
 
     except Error as error:
-        print("error al actualizar último acceso:", error)
+        log.error("error al actualizar último acceso:: %s", error)
         return False
 
 
@@ -842,7 +726,7 @@ Si recibió este mensaje, la configuración SMTP funciona correctamente.
         }), 200
 
     except Exception as error:
-        print("ERROR TEST CORREO:", str(error))
+        log.error("ERROR TEST CORREO:: %s", str(error))
 
         return jsonify({
             "estado": "error",
@@ -1093,77 +977,6 @@ def seguimiento_solicitud_publica(codigo):
         }), 500
 
 
-# =====================================================
-# ruta temporal para generar contraseñas reales
-# eliminar o comentar después de usar
-# =====================================================
-
-@app.route("/api/dev/reset-passwords", methods=["GET"])
-def reset_passwords():
-    conexion = get_db_connection()
-
-    if conexion is None:
-        return jsonify({
-            "estado": "error",
-            "mensaje": "no se pudo conectar con mysql"
-        }), 500
-
-    usuarios_passwords = [
-        ("admin", "admin123"),
-        ("jefe", "jefe123"),
-        ("autoridad", "autoridad123"),
-        ("tics", "tics123")
-    ]
-
-    try:
-        cursor = conexion.cursor()
-
-        for username, password in usuarios_passwords:
-            password_hash = crear_hash_password(password)
-
-            sql = """
-                update usuarios
-                set password_hash = %s
-                where usuario = %s;
-            """
-
-            cursor.execute(sql, (password_hash, username))
-
-        conexion.commit()
-
-        cursor.close()
-        conexion.close()
-
-        return jsonify({
-            "estado": "ok",
-            "mensaje": "contraseñas actualizadas correctamente",
-            "usuarios": [
-                {
-                    "usuario": "admin",
-                    "password": "admin123"
-                },
-                {
-                    "usuario": "jefe",
-                    "password": "jefe123"
-                },
-                {
-                    "usuario": "autoridad",
-                    "password": "autoridad123"
-                },
-                {
-                    "usuario": "tics",
-                    "password": "tics123"
-                }
-            ],
-            "advertencia": "esta ruta es temporal. después de usarla, se recomienda comentarla o eliminarla."
-        }), 200
-
-    except Error as error:
-        return jsonify({
-            "estado": "error",
-            "mensaje": "error al actualizar contraseñas",
-            "error": str(error)
-        }), 500
 
 
 # =====================================================
@@ -1394,7 +1207,7 @@ def listar_mis_solicitudes():
         }), 200
 
     except Error as error:
-        print("error al obtener solicitudes asignadas:", error)
+        log.error("error al obtener solicitudes asignadas:: %s", error)
 
         try:
             conexion.close()
@@ -1763,77 +1576,88 @@ def agregar_espacios_firmas(elementos, estilos, solicitud=None, modo_pdf="electr
         ]
         row_heights = [1.58 * cm, 3.15 * cm]
     else:
-        nombre_solicitante = texto_seguro(
-            solicitud.get("nombres_completos") or ""
-        )
-        nombre_jefe = texto_seguro(
-            solicitud.get("nombre_jefe_area") or "Jefe inmediato"
-        )
-        nombre_autoridad = texto_seguro(
-            solicitud.get("nombre_maxima_autoridad") or "Máxima autoridad institucional"
-        )
-        nombre_tics = texto_seguro(
-            solicitud.get("nombre_encargado_tics") or "Encargado TICS"
-        )
+        nombre_solicitante = texto_seguro(solicitud.get("nombres_completos") or "")
+        nombre_jefe       = texto_seguro(solicitud.get("nombre_jefe_area") or "Jefe inmediato")
+        nombre_autoridad  = texto_seguro(solicitud.get("nombre_maxima_autoridad") or "Máxima autoridad institucional")
+        nombre_tics       = texto_seguro(solicitud.get("nombre_encargado_tics") or "Encargado TICS")
+
+        # Layout 2×2: SOLICITANTE | JEFE (fila 1) — MÁXIMA AUTORIDAD | TICS (fila 2)
         data = [
+            # Fila 1 — encabezados
             [
                 Paragraph("<b>SOLICITANTE</b>", estilos["center_bold"]),
                 Paragraph("<b>JEFE INMEDIATO</b>", estilos["center_bold"]),
-                Paragraph("<b>MÁXIMA AUTORIDAD</b>", estilos["center_bold"]),
-                Paragraph("<b>TICS</b>", estilos["center_bold"])
             ],
+            # Fila 2 — espacio de firma (pyHanko coloca la firma aquí)
             [
-                Paragraph("_________________________", estilos["center"]),
-                Paragraph("_________________________", estilos["center"]),
-                Paragraph("_________________________", estilos["center"]),
-                Paragraph("_________________________", estilos["center"])
+                Paragraph("_______________________________", estilos["center"]),
+                Paragraph("_______________________________", estilos["center"]),
             ],
+            # Fila 3 — nombre del firmante
             [
                 Paragraph(_nombre_firma_html(nombre_solicitante), estilos["center"]),
                 Paragraph(_nombre_firma_html(nombre_jefe), estilos["center"]),
+            ],
+            # Fila 4 — encabezados fila 2
+            [
+                Paragraph("<b>MÁXIMA AUTORIDAD</b>", estilos["center_bold"]),
+                Paragraph("<b>TICS</b>", estilos["center_bold"]),
+            ],
+            # Fila 5 — espacio de firma
+            [
+                Paragraph("_______________________________", estilos["center"]),
+                Paragraph("_______________________________", estilos["center"]),
+            ],
+            # Fila 6 — nombre del firmante
+            [
                 Paragraph(_nombre_firma_html(nombre_autoridad), estilos["center"]),
-                Paragraph(_nombre_firma_html(nombre_tics), estilos["center"])
-            ]
+                Paragraph(_nombre_firma_html(nombre_tics), estilos["center"]),
+            ],
         ]
-        row_heights = [1.58 * cm, 2.0 * cm, None]
+        row_heights = [1.2 * cm, 2.5 * cm, None, 1.2 * cm, 2.5 * cm, None]
 
-    tabla = Table(
-        data,
-        colWidths=[4.35 * cm, 4.35 * cm, 4.35 * cm, 4.35 * cm],
-        rowHeights=row_heights
-    )
+    COL_2 = 8.7 * cm
 
     if modo_pdf == "manual":
+        tabla = Table(
+            data,
+            colWidths=[4.35 * cm, 4.35 * cm, 4.35 * cm, 4.35 * cm],
+            rowHeights=row_heights
+        )
         tabla.setStyle(TableStyle([
             ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#111827")),
             ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#374151")),
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eff6ff")),
-            ("VALIGN", (0, 0), (-1, 0), "MIDDLE"),
-            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
-            ("VALIGN", (0, 1), (-1, 1), "BOTTOM"),
-            ("ALIGN", (0, 1), (-1, 1), "LEFT"),
-            ("LEFTPADDING", (0, 1), (-1, 1), 6),
-            ("TOPPADDING", (0, 0), (-1, 0), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
-            ("TOPPADDING", (0, 1), (-1, 1), 6),
-            ("BOTTOMPADDING", (0, 1), (-1, 1), 4),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
         ]))
     else:
-        tabla.setStyle(TableStyle([
-            ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#111827")),
+        tabla = Table(
+            data,
+            colWidths=[COL_2, COL_2],
+            rowHeights=row_heights
+        )
+        estilo_comun = [
+            ("BOX",       (0, 0), (-1, -1), 0.8, colors.HexColor("#111827")),
             ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#374151")),
+            ("ALIGN",     (0, 0), (-1, -1), "CENTER"),
+            ("TOPPADDING",    (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            # Encabezados con fondo azul (filas 0 y 3)
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eff6ff")),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("BACKGROUND", (0, 3), (-1, 3), colors.HexColor("#eff6ff")),
             ("VALIGN", (0, 0), (-1, 0), "MIDDLE"),
+            ("VALIGN", (0, 3), (-1, 3), "MIDDLE"),
+            # Filas de firma: alinear contenido abajo
             ("VALIGN", (0, 1), (-1, 1), "BOTTOM"),
+            ("VALIGN", (0, 4), (-1, 4), "BOTTOM"),
+            # Filas de nombre: alinear arriba
             ("VALIGN", (0, 2), (-1, 2), "TOP"),
-            ("TOPPADDING", (0, 0), (-1, 0), 4),
-            ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
-            ("TOPPADDING", (0, 1), (-1, 1), 4),
-            ("BOTTOMPADDING", (0, 1), (-1, 1), 2),
-            ("TOPPADDING", (0, 2), (-1, 2), 2),
-            ("BOTTOMPADDING", (0, 2), (-1, 2), 4),
-        ]))
+            ("VALIGN", (0, 5), (-1, 5), "TOP"),
+        ]
+        tabla.setStyle(TableStyle(estilo_comun))
 
     elementos.append(tabla)
     elementos.append(Spacer(1, 0.22 * cm))
@@ -2114,7 +1938,7 @@ def generar_pdf_solicitud_a4(solicitud, paginas_web, incluir_seccion_tics=False,
     tabla_solicitante = Table(
     datos_solicitante,
     colWidths=[2.3 * cm, 6.4 * cm, 2.3 * cm, 6.4 * cm],
-    rowHeights=[0.50 * cm, 0.50 * cm, 0.50 * cm, 0.50 * cm]
+    rowHeights=[None, None, None, None]
 )
 
     tabla_solicitante.setStyle(TableStyle([
@@ -2173,7 +1997,7 @@ def generar_pdf_solicitud_a4(solicitud, paginas_web, incluir_seccion_tics=False,
     tabla_acceso = Table(
     datos_acceso,
     colWidths=[2.3 * cm, 6.4 * cm, 2.3 * cm, 6.4 * cm],
-    rowHeights=[0.50 * cm, 0.50 * cm, 0.50 * cm]
+    rowHeights=[None, None, None]
 )
 
     tabla_acceso.setStyle(TableStyle([
@@ -2381,7 +2205,7 @@ def descargar_pdf_solicitud(solicitud_id):
         return respuesta
 
     except Exception as error:
-        print("ERROR AL GENERAR PDF:", str(error))
+        log.error("ERROR AL GENERAR PDF:: %s", str(error))
 
         return jsonify({
             "estado": "error",
@@ -2477,7 +2301,7 @@ def registrar_documento_firmaec_si_existe(solicitud_id, codigo_solicitud, nombre
         return True
 
     except Exception as error:
-        print("advertencia: no se pudo registrar en solicitud_documentos:", error)
+        log.error("advertencia: no se pudo registrar en solicitud_documentos:: %s", error)
 
         try:
             cursor.close()
@@ -2749,7 +2573,7 @@ def preparar_solicitud_electronica_firmaec():
                 }
             )
         except Exception as error_auditoria:
-            print("advertencia: no se pudo registrar auditoría firmaec:", error_auditoria)
+            log.error("advertencia: no se pudo registrar auditoría firmaec:: %s", error_auditoria)
 
         return jsonify({
             "estado": "ok",
@@ -2784,7 +2608,7 @@ def preparar_solicitud_electronica_firmaec():
         except Exception:
             pass
 
-        print("ERROR MYSQL AL PREPARAR SOLICITUD ELECTRÓNICA:", error)
+        log.error("ERROR MYSQL AL PREPARAR SOLICITUD ELECTRÓNICA:: %s", error)
 
         return jsonify({
             "estado": "error",
@@ -2799,7 +2623,7 @@ def preparar_solicitud_electronica_firmaec():
         except Exception:
             pass
 
-        print("ERROR GENERAL AL PREPARAR SOLICITUD ELECTRÓNICA:", error)
+        log.error("ERROR GENERAL AL PREPARAR SOLICITUD ELECTRÓNICA:: %s", error)
 
         return jsonify({
             "estado": "error",
@@ -2940,7 +2764,7 @@ def subir_pdf_firmado_firmaec(codigo_solicitud):
                 }
             )
         except Exception as error_auditoria:
-            print("advertencia: no se pudo registrar auditoría de PDF firmado:", error_auditoria)
+            log.error("advertencia: no se pudo registrar auditoría de PDF firmado:: %s", error_auditoria)
 
         return jsonify({
             "estado": "ok",
@@ -2957,7 +2781,7 @@ def subir_pdf_firmado_firmaec(codigo_solicitud):
     except Error as error:
         conexion.rollback()
 
-        print("error al subir pdf firmado:", error)
+        log.error("error al subir pdf firmado:: %s", error)
 
         return jsonify({
             "estado": "error",
@@ -2968,7 +2792,7 @@ def subir_pdf_firmado_firmaec(codigo_solicitud):
     except Exception as error:
         conexion.rollback()
 
-        print("error inesperado al subir pdf firmado:", error)
+        log.error("error inesperado al subir pdf firmado:: %s", error)
 
         return jsonify({
             "estado": "error",
@@ -3123,7 +2947,7 @@ def registrar_solicitud_manual():
             archivo_pdf.write(pdf_buffer.getvalue())
 
     except Exception as error:
-        print("error al generar pdf manual:", error)
+        log.error("error al generar pdf manual:: %s", error)
 
         return jsonify({
             "estado": "error",
@@ -3199,7 +3023,7 @@ def registrar_solicitud_manual():
                 }
             )
         except Exception as error_auditoria:
-            print("advertencia: no se pudo registrar auditoría manual:", error_auditoria)
+            log.error("advertencia: no se pudo registrar auditoría manual:: %s", error_auditoria)
 
         return jsonify({
             "estado": "ok",
@@ -3221,7 +3045,7 @@ def registrar_solicitud_manual():
     except Error as error:
         conexion.rollback()
 
-        print("error al registrar solicitud manual:", error)
+        log.error("error al registrar solicitud manual:: %s", error)
 
         return jsonify({
             "estado": "error",
@@ -3326,12 +3150,12 @@ def validar_solicitud_manual(uuid_solicitud):
 
 def enviar_correo_activacion_manual(nombres, apellidos, correo, uuid_solicitud):
     if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
-        print("configuración SMTP incompleta. No se envió el correo de activación manual.")
+        log.info("configuración SMTP incompleta. No se envió el correo de activación manual.")
         return False
 
     correo_destino = limpiar_texto(correo).lower()
     if not correo_destino:
-        print("no existe correo destinatario para activación manual.")
+        log.info("no existe correo destinatario para activación manual.")
         return False
 
     nombre_completo = f"{nombres} {apellidos}".strip()
@@ -3415,10 +3239,10 @@ def enviar_correo_activacion_manual(nombres, apellidos, correo, uuid_solicitud):
             cuerpo=cuerpo_texto,
             cuerpo_html=cuerpo_html
         )
-        print(f"correo de activación manual enviado a {correo_destino}")
+        log.info(f"correo de activación manual enviado a {correo_destino}")
         return True
     except Exception as error:
-        print("error al enviar correo de activación manual:", error)
+        log.error("error al enviar correo de activación manual:: %s", error)
         return False
 
 
@@ -3572,7 +3396,7 @@ def subir_documento_manual_firmado(uuid_solicitud):
                 }
             )
         except Exception as error_auditoria:
-            print("advertencia: no se pudo registrar auditoría de subida manual:", error_auditoria)
+            log.error("advertencia: no se pudo registrar auditoría de subida manual:: %s", error_auditoria)
 
         # enviar correo de activación automático al correo registrado en el formulario manual
         correo_enviado = False
@@ -3584,7 +3408,7 @@ def subir_documento_manual_firmado(uuid_solicitud):
                 uuid_solicitud=uuid_solicitud
             )
         except Exception as error_correo:
-            print("advertencia: no se pudo enviar correo de activación manual:", error_correo)
+            log.error("advertencia: no se pudo enviar correo de activación manual:: %s", error_correo)
 
         return jsonify({
             "estado": "ok",
@@ -3752,7 +3576,7 @@ def listar_procesos_manuales_admin():
         }), 200
 
     except Error as error:
-        print("ERROR AL LISTAR PROCESOS MANUALES:", error)
+        log.error("ERROR AL LISTAR PROCESOS MANUALES:: %s", error)
 
         try:
             conexion.close()
@@ -3832,7 +3656,16 @@ def descargar_documento_manual_firmado_admin(uuid_solicitud):
                 "mensaje": "la solicitud manual no tiene documento firmado subido."
             }), 404
 
-        ruta_archivo = os.path.join(ESCANEADOS_FOLDER, solicitud["documento_escaneado"])
+        ruta_archivo = validar_ruta_segura(
+            os.path.join(ESCANEADOS_FOLDER, solicitud["documento_escaneado"]),
+            ESCANEADOS_FOLDER
+        )
+
+        if not ruta_archivo:
+            return jsonify({
+                "estado": "error",
+                "mensaje": "ruta de archivo no permitida."
+            }), 403
 
         if not os.path.exists(ruta_archivo):
             return jsonify({
@@ -3857,7 +3690,7 @@ def descargar_documento_manual_firmado_admin(uuid_solicitud):
                 }
             )
         except Exception as error_auditoria:
-            print("advertencia: no se pudo registrar auditoría de descarga manual:", error_auditoria)
+            log.error("advertencia: no se pudo registrar auditoría de descarga manual:: %s", error_auditoria)
 
         return send_file(
             ruta_archivo,
@@ -4002,7 +3835,7 @@ def listar_procesos_electronicos_admin():
         }), 200
 
     except Error as error:
-        print("error al obtener procesos electrónicos:", error)
+        log.error("error al obtener procesos electrónicos:: %s", error)
 
         return jsonify({
             "estado": "error",
@@ -4104,9 +3937,10 @@ def descargar_pdf_actual_proceso_electronico_admin(codigo_solicitud):
         if documento:
             ruta_archivo = documento.get("ruta_archivo")
 
-            if ruta_archivo and os.path.exists(ruta_archivo):
+            ruta_segura = validar_ruta_segura(ruta_archivo, UPLOAD_FOLDER) if ruta_archivo else None
+            if ruta_segura and os.path.exists(ruta_segura):
                 return send_file(
-                    ruta_archivo,
+                    ruta_segura,
                     mimetype="application/pdf",
                     as_attachment=True,
                     download_name=f"documento_actual_{codigo_solicitud}.pdf",
@@ -4117,10 +3951,10 @@ def descargar_pdf_actual_proceso_electronico_admin(codigo_solicitud):
             nombre_archivo = documento.get("nombre_archivo")
 
             posibles_rutas = [
-                os.path.join(FIRMADOS_FOLDER, nombre_archivo),
-                os.path.join(DOCUMENTOS_FOLDER, nombre_archivo),
-                os.path.join(ESCANEADOS_FOLDER, nombre_archivo)
-            ]
+                validar_ruta_segura(os.path.join(FIRMADOS_FOLDER, nombre_archivo), FIRMADOS_FOLDER),
+                validar_ruta_segura(os.path.join(DOCUMENTOS_FOLDER, nombre_archivo), DOCUMENTOS_FOLDER),
+                validar_ruta_segura(os.path.join(ESCANEADOS_FOLDER, nombre_archivo), ESCANEADOS_FOLDER),
+            ] if nombre_archivo else []
 
             for ruta in posibles_rutas:
                 if ruta and os.path.exists(ruta):
@@ -4173,7 +4007,7 @@ def descargar_pdf_actual_proceso_electronico_admin(codigo_solicitud):
         )
 
     except Error as error:
-        print("error al descargar pdf actual electrónico:", error)
+        log.error("error al descargar pdf actual electrónico:: %s", error)
 
         return jsonify({
             "estado": "error",
@@ -4182,7 +4016,7 @@ def descargar_pdf_actual_proceso_electronico_admin(codigo_solicitud):
         }), 500
 
     except Exception as error:
-        print("error inesperado al descargar pdf actual electrónico:", error)
+        log.error("error inesperado al descargar pdf actual electrónico:: %s", error)
 
         return jsonify({
             "estado": "error",
@@ -5036,13 +4870,18 @@ def descargar_documento_actual_solicitud(solicitud_id):
                 "mensaje": "el documento no tiene ruta registrada."
             }), 404
 
-        ruta_archivo = os.path.normpath(ruta_archivo)
+        ruta_archivo = validar_ruta_segura(ruta_archivo, UPLOAD_FOLDER)
+
+        if not ruta_archivo:
+            return jsonify({
+                "estado": "error",
+                "mensaje": "acceso a archivo no permitido."
+            }), 403
 
         if not os.path.exists(ruta_archivo):
             return jsonify({
                 "estado": "error",
-                "mensaje": "el archivo firmado no existe físicamente en el servidor.",
-                "ruta_archivo": ruta_archivo
+                "mensaje": "el archivo firmado no existe físicamente en el servidor."
             }), 404
 
         nombre_descarga = documento.get("nombre_archivo") or f"{solicitud['codigo_solicitud']}-firmado.pdf"
@@ -5369,12 +5208,12 @@ def aprobar_solicitud(solicitud_id):
 
 def enviar_correo_rechazo_solicitud(solicitud, motivo, rol_rechazo):
     if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
-        print("configuración SMTP incompleta. No se envió el correo de rechazo.")
+        log.info("configuración SMTP incompleta. No se envió el correo de rechazo.")
         return False
 
     correo_destino = limpiar_texto(solicitud.get("correo_institucional")).lower()
     if not correo_destino:
-        print("la solicitud no tiene correo registrado.")
+        log.info("la solicitud no tiene correo registrado.")
         return False
 
     codigo_solicitud = solicitud.get("codigo_solicitud", "")
@@ -5480,10 +5319,10 @@ def enviar_correo_rechazo_solicitud(solicitud, motivo, rol_rechazo):
             cuerpo=cuerpo_texto,
             cuerpo_html=cuerpo_html
         )
-        print(f"correo de rechazo enviado a {correo_destino}")
+        log.info(f"correo de rechazo enviado a {correo_destino}")
         return True
     except Exception as error:
-        print("error al enviar correo de rechazo:", error)
+        log.error("error al enviar correo de rechazo:: %s", error)
         return False
 # =====================================================
 # correo de finalización / aprobación total de solicitud
@@ -5798,16 +5637,12 @@ def rechazar_solicitud(solicitud_id):
                 motivo=motivo,
                 rol_rechazo=nombre_rechazador
             )
-            print("==============================================")
-            print("RESULTADO CORREO DE RECHAZO")
-            print("DESTINATARIO:", solicitud.get("correo_institucional"))
-            print("CORREO ENVIADO:", correo_enviado)
-            print("ERROR CORREO:", error_correo)
-            print("==============================================")
+            log.info("RESULTADO CORREO DE RECHAZO — destinatario: %s, enviado: %s, error: %s",
+                     solicitud.get("correo_institucional"), correo_enviado, error_correo)
         except Exception as error_email:
             correo_enviado = False
             error_correo = str(error_email)
-            print("error al enviar correo de rechazo:", error_correo)
+            log.error("error al enviar correo de rechazo:: %s", error_correo)
 
         cursor.close()
         conexion.close()
@@ -7822,7 +7657,7 @@ def descargar_pdf_publico_firmaec(codigo_solicitud):
         return respuesta
 
     except Error as error:
-        print("ERROR MYSQL AL DESCARGAR PDF FIRMAEC:", error)
+        log.error("ERROR MYSQL AL DESCARGAR PDF FIRMAEC:: %s", error)
 
         try:
             conexion.close()
@@ -7836,7 +7671,7 @@ def descargar_pdf_publico_firmaec(codigo_solicitud):
         }), 500
 
     except Exception as error:
-        print("ERROR GENERAL AL GENERAR PDF FIRMAEC:", error)
+        log.error("ERROR GENERAL AL GENERAR PDF FIRMAEC:: %s", error)
 
         try:
             conexion.close()
@@ -8172,7 +8007,7 @@ def crear_jefes_ficticios():
         except Exception:
             pass
 
-        print("ERROR AL CREAR JEFES FICTICIOS:", error)
+        log.error("ERROR AL CREAR JEFES FICTICIOS:: %s", error)
 
         return jsonify({
             "estado": "error",
@@ -8187,7 +8022,7 @@ def crear_jefes_ficticios():
         except Exception:
             pass
 
-        print("ERROR GENERAL AL CREAR JEFES FICTICIOS:", error)
+        log.error("ERROR GENERAL AL CREAR JEFES FICTICIOS:: %s", error)
 
         return jsonify({
             "estado": "error",
@@ -8439,7 +8274,7 @@ def subir_pdf_firmado_publico_firmaec(codigo_solicitud):
                 }
             )
         except Exception as error_auditoria:
-            print("advertencia: no se pudo registrar auditoría de firma solicitante:", error_auditoria)
+            log.error("advertencia: no se pudo registrar auditoría de firma solicitante:: %s", error_auditoria)
 
         return jsonify({
             "estado": "ok",
@@ -8465,7 +8300,7 @@ def subir_pdf_firmado_publico_firmaec(codigo_solicitud):
         except Exception:
             pass
 
-        print("ERROR MYSQL AL SUBIR PDF FIRMADO SOLICITANTE:", error)
+        log.error("ERROR MYSQL AL SUBIR PDF FIRMADO SOLICITANTE:: %s", error)
 
         return jsonify({
             "estado": "error",
@@ -8480,7 +8315,7 @@ def subir_pdf_firmado_publico_firmaec(codigo_solicitud):
         except Exception:
             pass
 
-        print("ERROR GENERAL AL SUBIR PDF FIRMADO SOLICITANTE:", error)
+        log.error("ERROR GENERAL AL SUBIR PDF FIRMADO SOLICITANTE:: %s", error)
 
         return jsonify({
             "estado": "error",
@@ -8681,7 +8516,7 @@ def jefe_subir_pdf_firmado(solicitud_id):
                 }
             )
         except Exception as error_auditoria:
-            print("advertencia: no se pudo registrar auditoría de firma del jefe:", error_auditoria)
+            log.error("advertencia: no se pudo registrar auditoría de firma del jefe:: %s", error_auditoria)
 
         return jsonify({
             "estado": "ok",
@@ -8706,7 +8541,7 @@ def jefe_subir_pdf_firmado(solicitud_id):
         except Exception:
             pass
 
-        print("ERROR MYSQL AL SUBIR PDF FIRMADO POR JEFE:", error)
+        log.error("ERROR MYSQL AL SUBIR PDF FIRMADO POR JEFE:: %s", error)
 
         return jsonify({
             "estado": "error",
@@ -8721,7 +8556,7 @@ def jefe_subir_pdf_firmado(solicitud_id):
         except Exception:
             pass
 
-        print("ERROR GENERAL AL SUBIR PDF FIRMADO POR JEFE:", error)
+        log.error("ERROR GENERAL AL SUBIR PDF FIRMADO POR JEFE:: %s", error)
 
         return jsonify({
             "estado": "error",
@@ -8835,7 +8670,7 @@ def _registrar_auditoria_firma(
         cursor.close()
         conexion.close()
     except Exception as e:
-        print(f"advertencia auditoria_firmas: {e}")
+        log.error(f"advertencia auditoria_firmas: {e}")
 
 
 def _registrar_version_documento(
@@ -8881,27 +8716,23 @@ def _registrar_version_documento(
         conexion.close()
         return version_id
     except Exception as e:
-        print(f"advertencia versiones_documento: {e}")
+        log.error(f"advertencia versiones_documento: {e}")
         return None
 
 
 def _firmar_pdf_pyhanko(ruta_pdf_entrada, ruta_pdf_salida, ruta_cert, password_bytes,
-                        rol_firmante, razon, ubicacion, contacto, nombre_campo):
-    """
-    Aplica la firma digital criptográfica al PDF usando pyHanko.
-    - Genera PAdES compatible con FirmaEC y Adobe Acrobat.
-    - Coloca la firma visible exactamente en la columna del rol.
-    - Elimina el certificado temporal inmediatamente después de firmar.
-    Retorna (exito: bool, mensaje: str)
-    """
+                        rol_firmante, razon, ubicacion, contacto, nombre_campo,
+                        url_qr: str = "", nombre_firmante: str = ""):
     num_pagina, box = _encontrar_rect_firma(ruta_pdf_entrada, rol_firmante)
     if box is None:
-        # Fallback con coordenadas aproximadas para A4 (bottom-left origin)
+        # Fallback para layout 2×2: columnas de 8.7 cm
+        # Fila superior: solicitante (izq) | jefe (der)
+        # Fila inferior: autoridad (izq)   | tics (der)
         fallback = {
-            "solicitante":      (57,  82, 180, 138),
-            "jefe_inmediato":   (180, 82, 303, 138),
-            "maxima_autoridad": (303, 82, 427, 138),
-            "analista_tics":    (427, 82, 550, 138),
+            "solicitante":      (57,  150, 303, 220),
+            "jefe_inmediato":   (303, 150, 539, 220),
+            "maxima_autoridad": (57,   65, 303, 135),
+            "analista_tics":    (303,  65, 539, 135),
         }
         box = fallback.get(rol_firmante, (57, 82, 180, 138))
         num_pagina = 0
@@ -8912,42 +8743,71 @@ def _firmar_pdf_pyhanko(ruta_pdf_entrada, ruta_pdf_salida, ruta_cert, password_b
             passphrase=password_bytes
         )
 
+        # Estilo QR: nombre del firmante + timestamp + QR de verificación
+        from pyhanko.pdf_utils.layout import SimpleBoxLayoutRule, AxisAlignment, Margins, InnerScaling
+        stamp_style = QRStampStyle(
+            stamp_text="Firmado electrónicamente por:\n%(signer)s",
+            text_box_style=TextBoxStyle(font_size=6),
+            background=None,
+            background_opacity=0,
+            border_width=0,
+            innsep=3,
+            qr_position=QRPosition.LEFT_OF_TEXT,
+            qr_inner_size=42,   # QR 42pt (~1.5 cm) — deja ~75pt para el texto
+            background_layout=SimpleBoxLayoutRule(
+                x_align=AxisAlignment.ALIGN_MIN,
+                y_align=AxisAlignment.ALIGN_MID,
+                margins=Margins(left=2, right=2, top=2, bottom=2),
+                inner_content_scaling=InnerScaling.SHRINK_TO_FIT,
+            ),
+        )
+
+        sig_meta = PdfSignatureMetadata(
+            field_name=nombre_campo,
+            reason=razon,
+            location=ubicacion,
+            contact_info=contacto,
+            certify=False,
+        )
+
+        pdf_signer = signers.PdfSigner(
+            signature_meta=sig_meta,
+            signer=signer,
+            stamp_style=stamp_style,
+            new_field_spec=SigFieldSpec(
+                sig_field_name=nombre_campo,
+                on_page=num_pagina,
+                box=box,
+            ),
+        )
+
         with open(ruta_pdf_entrada, "rb") as pdf_in:
             w = IncrementalPdfFileWriter(pdf_in)
-
-            fields.append_signature_field(
-                w,
-                sig_field_spec=SigFieldSpec(
-                    sig_field_name=nombre_campo,
-                    on_page=num_pagina,
-                    box=box
-                )
-            )
-
-            sig_meta = PdfSignatureMetadata(
-                field_name=nombre_campo,
-                reason=razon,
-                location=ubicacion,
-                contact_info=contacto,
-                certify=False
-            )
-
             with open(ruta_pdf_salida, "wb") as pdf_out:
                 asyncio.run(
-                    signers.async_sign_pdf(
+                    pdf_signer.async_sign_pdf(
                         w,
-                        signature_meta=sig_meta,
-                        signer=signer,
-                        output=pdf_out
+                        output=pdf_out,
+                        appearance_text_params={"url": url_qr or nombre_firmante or "INAMHI"},
                     )
                 )
 
         return True, "ok"
 
-    except SigningError as e:
-        return False, f"Error de firma: {str(e)}"
     except Exception as e:
-        return False, f"Error al firmar: {str(e)[:200]}"
+        import traceback; traceback.print_exc()
+        return False, f"Error al firmar: {str(e)}"
+
+
+def _validar_firma_pdf(ruta_pdf: str) -> str:
+    try:
+        with open(ruta_pdf, "rb") as f:
+            r = PdfFileReader(f)
+            if r.embedded_signatures:
+                return "firma_presente"
+        return "sin_firmas_detectadas"
+    except Exception:
+        return "no_validado"
 
 
 def _encontrar_rect_firma(ruta_pdf, rol_firmante):
@@ -8973,36 +8833,43 @@ def _encontrar_rect_firma(ruta_pdf, rol_firmante):
     if not textos:
         return 0, None
 
-    COL_W   = 4.35 * 28.3465  # ≈ 123.3 pts
-    FIRMA_H = 56               # ≈ 2 cm
+    FIRMA_H = 70   # ≈ 2.5 cm
     TITULO_SECCION = ["FIRMAS DE RESPONSABILIDAD", "FIRMAS DE RESPONSAB"]
+
+    # Posiciones X fijas por columna (layout 2×2, A4 con márgenes ~57 pts)
+    # Col izquierda: SOLICITANTE y MÁXIMA AUTORIDAD  → x: 57 .. 299
+    # Col derecha:   JEFE INMEDIATO y TICS           → x: 299 .. 540
+    X_COL = {
+        "solicitante":      (57, 299),
+        "jefe_inmediato":   (299, 540),
+        "maxima_autoridad": (57, 299),
+        "analista_tics":    (299, 540),
+    }
+    x0_fijo, x1_fijo = X_COL.get(rol_firmante, (57, 299))
 
     doc = fitz.open(ruta_pdf)
     try:
         for pn in range(doc.page_count - 1, -1, -1):
             page = doc[pn]
             ph   = page.rect.height
-            pw   = page.rect.width
 
-            # Buscar y_min: la y del título de la sección de firmas (ancla)
+            # Ancla: título de la sección
             y_anchor = 0.0
             for t_sec in TITULO_SECCION:
                 sec_rects = page.search_for(t_sec)
                 if sec_rects:
-                    y_anchor = sec_rects[0].y0  # top del título
+                    y_anchor = sec_rects[0].y0
                     break
 
-            # Buscar el texto del encabezado de columna
+            # Detectar y del encabezado del rol para obtener la y de la fila de firma
             mejor_rect = None
             for txt in textos:
                 todas = page.search_for(txt)
                 if not todas:
                     continue
-                # Filtrar solo ocurrencias que estén DESPUÉS del título (y > y_anchor)
                 candidatos = [r for r in todas if r.y0 >= y_anchor]
                 if not candidatos:
-                    candidatos = todas  # fallback sin filtro
-                # Tomar la ocurrencia con mayor y (más abajo en la página)
+                    candidatos = todas
                 mejor = max(candidatos, key=lambda r: r.y0)
                 if mejor_rect is None or mejor.y0 > mejor_rect.y0:
                     mejor_rect = mejor
@@ -9010,14 +8877,12 @@ def _encontrar_rect_firma(ruta_pdf, rol_firmante):
             if mejor_rect is None:
                 continue
 
-            r = mejor_rect
-            x0    = r.x0
-            x1    = min(x0 + COL_W, pw - 2)  # clamp al ancho de página
-            y0_mu = r.y1 + 4
+            # Usar X fijas de columna, solo Y detectada del encabezado
+            y0_mu = mejor_rect.y1 + 4
             y1_mu = y0_mu + FIRMA_H
 
             # Convertir PyMuPDF (top-left) → pyHanko (bottom-left)
-            box = (x0, ph - y1_mu, x1, ph - y0_mu)
+            box = (x0_fijo, ph - y1_mu, x1_fijo, ph - y0_mu)
             return pn, box
     finally:
         doc.close()
@@ -9112,7 +8977,7 @@ def _inicializar_tablas_firma():
         cursor.close()
         conexion.close()
     except Exception as e:
-        print(f"advertencia al crear tablas de firma: {e}")
+        log.error(f"advertencia al crear tablas de firma: {e}")
 
 
 # =====================================================
@@ -9323,6 +9188,15 @@ def firmar_pdf_con_pyhanko(solicitud_id):
 
         # --- FIRMA CON PYHANKO (función centralizada) ---
         nombre_campo = f"Firma_{rol_actual}_{timestamp}"
+        nombre_firmante_qr = f"{usuario_actual.get('nombres', '')} {usuario_actual.get('apellidos', '')}".strip()
+        _fecha_qr = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S-05:00")
+        url_qr_firma = (
+            f"FIRMADO POR: {nombre_firmante_qr}\n"
+            f"RAZON: Aprobacion institucional - INAMHI\n"
+            f"LOCALIZACION: Ecuador - INAMHI\n"
+            f"FECHA: {_fecha_qr}\n"
+            f"VALIDAR CON: https://www.firmadigital.gob.ec"
+        )
         try:
             exito_firma, msg_firma = _firmar_pdf_pyhanko(
                 ruta_pdf_entrada=ruta_pdf_entrada,
@@ -9333,7 +9207,9 @@ def firmar_pdf_con_pyhanko(solicitud_id):
                 razon=f"Aprobación institucional — {etapa_legible_pdf(solicitud['etapa_actual'])}",
                 ubicacion="Ecuador — INAMHI",
                 contacto=usuario_actual.get("correo", "inamhi@gob.ec"),
-                nombre_campo=nombre_campo
+                nombre_campo=nombre_campo,
+                url_qr=url_qr_firma,
+                nombre_firmante=nombre_firmante_qr,
             )
         finally:
             if ruta_cert_tmp and os.path.exists(ruta_cert_tmp):
@@ -9355,20 +9231,7 @@ def firmar_pdf_con_pyhanko(solicitud_id):
         tamano_bytes = os.path.getsize(ruta_pdf_firmado)
 
         # Validar firma recién generada
-        resultado_validacion = "ok"
-        try:
-            with open(ruta_pdf_firmado, "rb") as f_val:
-                r_val = PdfFileReader(f_val)
-                firmas_emb = r_val.embedded_signatures
-                if not firmas_emb:
-                    resultado_validacion = "sin_firmas_detectadas"
-                else:
-                    estado_val = asyncio.run(validate_pdf_signature(firmas_emb[0]))
-                    resultado_validacion = (
-                        "valida" if estado_val.valid else "invalida"
-                    )
-        except Exception as e_val:
-            resultado_validacion = f"no_validado: {str(e_val)[:100]}"
+        resultado_validacion = _validar_firma_pdf(ruta_pdf_firmado)
 
         # Registrar firma en firmas_digitales
         cursor.execute("""
@@ -9385,7 +9248,7 @@ def firmar_pdf_con_pyhanko(solicitud_id):
             info_cert["issuer_cn"], info_cert["numero_serie"],
             nombre_pdf_entrada, nombre_pdf_firmado, ruta_pdf_firmado,
             hash_antes, hash_despues,
-            1 if resultado_validacion in ("ok", "valida") else 0,
+            1 if resultado_validacion in ("ok", "valida", "firma_presente") else 0,
             resultado_validacion, observacion, ip_cliente
         ))
         firma_id = cursor.lastrowid
@@ -9895,6 +9758,15 @@ def firmar_pyhanko_solicitante(codigo_solicitud):
 
         # --- FIRMA CON PYHANKO EN COLUMNA SOLICITANTE ---
         nombre_campo = f"Firma_solicitante_{timestamp}"
+        nombre_firmante_qr = info_cert.get("subject_cn", solicitud.get("nombres_completos", ""))
+        _fecha_qr = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S-05:00")
+        url_qr_firma = (
+            f"FIRMADO POR: {nombre_firmante_qr}\n"
+            f"RAZON: Firma electronica del solicitante - INAMHI\n"
+            f"LOCALIZACION: Ecuador - INAMHI\n"
+            f"FECHA: {_fecha_qr}\n"
+            f"VALIDAR CON: https://www.firmadigital.gob.ec"
+        )
         try:
             exito_firma, msg_firma = _firmar_pdf_pyhanko(
                 ruta_pdf_entrada=ruta_base_pdf,
@@ -9905,7 +9777,9 @@ def firmar_pyhanko_solicitante(codigo_solicitud):
                 razon="Firma electrónica del solicitante — INAMHI",
                 ubicacion="Ecuador — INAMHI",
                 contacto=solicitud.get("correo_institucional", ""),
-                nombre_campo=nombre_campo
+                nombre_campo=nombre_campo,
+                url_qr=url_qr_firma,
+                nombre_firmante=nombre_firmante_qr,
             )
         finally:
             if ruta_cert_tmp and os.path.exists(ruta_cert_tmp):
@@ -9927,18 +9801,7 @@ def firmar_pyhanko_solicitante(codigo_solicitud):
         tamano_bytes = os.path.getsize(ruta_pdf_firmado)
 
         # Validar firma
-        resultado_validacion = "ok"
-        try:
-            with open(ruta_pdf_firmado, "rb") as f_val:
-                r_val = PdfFileReader(f_val)
-                firmas_emb = r_val.embedded_signatures
-                if firmas_emb:
-                    estado_val = asyncio.run(validate_pdf_signature(firmas_emb[0]))
-                    resultado_validacion = "valida" if estado_val.valid else "invalida"
-                else:
-                    resultado_validacion = "sin_firmas_detectadas"
-        except Exception as e_val:
-            resultado_validacion = f"no_validado: {str(e_val)[:80]}"
+        resultado_validacion = _validar_firma_pdf(ruta_pdf_firmado)
 
         # Registrar en firmas_digitales
         cursor.execute("""
@@ -9955,7 +9818,7 @@ def firmar_pyhanko_solicitante(codigo_solicitud):
             info_cert["issuer_cn"], info_cert["numero_serie"],
             nombre_base_pdf, nombre_pdf_firmado, ruta_pdf_firmado,
             hash_antes, hash_despues,
-            1 if resultado_validacion in ("ok", "valida") else 0,
+            1 if resultado_validacion in ("ok", "valida", "firma_presente") else 0,
             resultado_validacion, observacion, ip_cliente
         ))
         firma_id = cursor.lastrowid
@@ -10074,6 +9937,9 @@ def firmar_pyhanko_solicitante(codigo_solicitud):
         }), 201
 
     except Exception as error:
+        import traceback
+        print(f"\n[POST-FIRMA ERROR] {type(error).__name__}: {error}")
+        traceback.print_exc()
         if ruta_cert_tmp and os.path.exists(ruta_cert_tmp):
             try:
                 os.remove(ruta_cert_tmp)
@@ -10086,8 +9952,8 @@ def firmar_pyhanko_solicitante(codigo_solicitud):
             pass
         return jsonify({
             "estado": "error",
-            "mensaje": "Error al firmar el documento.",
-            "error": str(error)[:200]
+            "mensaje": f"{type(error).__name__}: {str(error)[:300]}",
+            "error": str(error)[:300]
         }), 500
 
 
@@ -10105,15 +9971,15 @@ if __name__ == "__main__":
     # Inicializar pool de conexiones antes de servir requests
     init_db(app)
 
-    print("=" * 42)
-    print(" INAMHI — Backend Liberación Web")
-    print("=" * 42)
-    print(f" Puerto        : {BACKEND_PORT}")
-    print(f" BD pool       : {DB_NAME}@{DB_HOST}")
-    print(f" Local         : http://127.0.0.1:{BACKEND_PORT}/api/test")
-    print(f" Red           : http://{IP_RED}:{BACKEND_PORT}/api/test")
-    print(f" Frontend      : http://localhost:4300")
-    print(f" Angular red   : ng serve --host 0.0.0.0 --port 4300")
-    print("=" * 42)
+    log.info("=" * 42)
+    log.info(" INAMHI — Backend Liberación Web")
+    log.info("=" * 42)
+    log.info(f" Puerto        : {BACKEND_PORT}")
+    log.info(f" BD pool       : {DB_NAME}@{DB_HOST}")
+    log.info(f" Local         : http://127.0.0.1:{BACKEND_PORT}/api/test")
+    log.info(f" Red           : http://{IP_RED}:{BACKEND_PORT}/api/test")
+    log.info(f" Frontend      : http://localhost:4300")
+    log.info(f" Angular red   : ng serve --host 0.0.0.0 --port 4300")
+    log.info("=" * 42)
 
     app.run(host="0.0.0.0", port=BACKEND_PORT, debug=False)
