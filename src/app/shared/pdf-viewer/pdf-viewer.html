@@ -1,0 +1,40 @@
+<div class="pdf-backdrop" (click)="cerrarVisor()">
+  <div class="pdf-modal" (click)="$event.stopPropagation()">
+
+    <div class="pdf-header">
+      <div class="pdf-header-titulo">
+        <i class="bi bi-file-earmark-pdf-fill"></i>
+        <span>{{ titulo }}</span>
+      </div>
+
+      <div class="pdf-header-actions">
+        <button type="button" class="pdf-btn-download" (click)="descargar()">
+          <i class="bi bi-download"></i>
+          Descargar
+        </button>
+
+        <button type="button" class="pdf-btn-close" (click)="cerrarVisor()" aria-label="Cerrar visor">
+          <i class="bi bi-x-lg"></i>
+        </button>
+      </div>
+    </div>
+
+    <div class="pdf-body">
+      @if (cargando) {
+        <div class="pdf-loading">
+          <div class="pdf-spinner"></div>
+          <span>Cargando documento...</span>
+        </div>
+      }
+
+      <iframe
+        [src]="urlSegura"
+        class="pdf-frame"
+        [class.pdf-frame-hidden]="cargando"
+        (load)="onIframeLoad()"
+        title="Visor de documento PDF"
+      ></iframe>
+    </div>
+
+  </div>
+</div>

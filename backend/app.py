@@ -1,0 +1,10119 @@
+from io import BytesIO
+import json
+import uuid
+import smtplib
+import html
+import hashlib
+import tempfile
+import asyncio
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.image import MIMEImage
+import os
+import re
+import ipaddress
+import datetime
+from functools import wraps
+from urllib.parse import urlparse
+
+from flask import Flask, jsonify, request, send_file
+import fitz
+import base64
+
+from werkzeug.utils import secure_filename
+from werkzeug.exceptions import BadRequest
+from flask_cors import CORS
+from dotenv import load_dotenv
+
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import cm
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+    Image
+)
+
+import mysql.connector
+from mysql.connector import Error
+
+import jwt
+import bcrypt
+
+# =====================================================
+# pyHanko — firma digital criptográfica real
+# =====================================================
+
+try:
+    from cryptography.hazmat.primitives.serialization import pkcs12
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes
+    from pyhanko.sign import signers, fields
+    from pyhanko.sign.fields import SigFieldSpec
+    from pyhanko.pdf_utils.incremental_writer import IncrementalPdfFileWriter
+    from pyhanko.sign.signers.pdf_signer import PdfSignatureMetadata
+    from pyhanko.sign.general import SigningError
+    from pyhanko.pdf_utils.reader import PdfFileReader
+    from pyhanko.sign.validation import validate_pdf_signature
+    # Perfil PAdES — requerido para compatibilidad con FirmaEC y Adobe
+    from pyhanko.sign import signers as _pyh_signers
+    try:
+        from pyhanko.sign.signers.pdf_signer import PdfSignatureMetadata as PdfSigMeta
+    except ImportError:
+        PdfSigMeta = PdfSignatureMetadata
+    PYHANKO_DISPONIBLE = True
+except ImportError:
+    PYHANKO_DISPONIBLE = False
+    SigningError = Exception
+    print("ADVERTENCIA: pyHanko no está instalado. Instale con: pip install pyhanko pyhanko-certvalidator cryptography")
+
+# =====================================================
+# qrcode — generación de QR para verificación pública
+# =====================================================
+
+try:
+    import qrcode
+    from PIL import Image as PILImage
+    QRCODE_DISPONIBLE = True
+except ImportError:
+    QRCODE_DISPONIBLE = False
+
+# =====================================================
+# cargar variables de entorno y configuración central
+# =====================================================
+
+load_dotenv()
+
+from config import (
+    BASE_DIR as _BASE_DIR,
+    DB_HOST, DB_PORT, DB_USER, DB_PASSWORD, DB_NAME,
+    JWT_SECRET_KEY, JWT_EXPIRATION_HOURS,
+    SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM,
+    APP_URL, BACKEND_PORT,
+    UPLOAD_FOLDER, DOCUMENTOS_FOLDER, FIRMADOS_FOLDER,
+    ESCANEADOS_FOLDER, TEMP_CERTS_FOLDER, LOGO_INAMHI_PATH,
+    CORS_ORIGINS,
+)
+
+# Módulos de utilidades centralizados
+from utils.db import get_db_connection, init_db
+from utils.auth_utils import (
+    crear_hash_password, verificar_password,
+    generar_token, decodificar_token,
+    token_requerido, roles_permitidos,
+)
+from utils.helpers import (
+    limpiar_texto, normalizar_espacios, obtener_ip_cliente,
+    validar_solo_letras_espacios, validar_correo_general,
+    validar_cedula_formato, validar_telefono_10_digitos,
+    validar_ipv4, validar_url, validar_fecha, convertir_fecha,
+)
+from utils.audit import registrar_auditoria
+from utils.user_utils import (
+    obtener_usuario_por_username, obtener_usuario_por_id, actualizar_ultimo_acceso,
+)
+
+
+# =====================================================
+# configuración SMTP para envío de correos
+# =====================================================
+
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
+SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
+
+# =====================================================
+# función base para enviar correos
+# =====================================================
+
+def _logo_email_tag():
+    return (
+        '<img src="cid:logo_inamhi" alt="INAMHI" '
+        'style="height:70px;width:auto;display:block;margin:0 auto 12px;object-fit:contain;">'
+    )
+
+
+def _logo_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "img", "logo_inamhi.png")
+
+
+def enviar_correo(destinatario, asunto, cuerpo, cuerpo_html=None):
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
+        raise Exception(
+            "configuración SMTP incompleta. revise SMTP_HOST, SMTP_USER y SMTP_PASSWORD en el archivo .env."
+        )
+
+    destinatario = limpiar_texto(destinatario).lower()
+    if not destinatario:
+        raise Exception("no existe correo destinatario.")
+
+    logo = _logo_path()
+    tiene_logo = bool(cuerpo_html and os.path.exists(logo))
+
+    if tiene_logo:
+        # multipart/related permite referenciar imágenes inline por CID
+        mensaje = MIMEMultipart("related")
+        alternativo = MIMEMultipart("alternative")
+        alternativo.attach(MIMEText(cuerpo, "plain", "utf-8"))
+        alternativo.attach(MIMEText(cuerpo_html, "html", "utf-8"))
+        mensaje.attach(alternativo)
+
+        with open(logo, "rb") as f:
+            img = MIMEImage(f.read(), _subtype="png")
+        img.add_header("Content-ID", "<logo_inamhi>")
+        img.add_header("Content-Disposition", "inline", filename="logo_inamhi.png")
+        mensaje.attach(img)
+    else:
+        mensaje = MIMEMultipart("alternative")
+        mensaje.attach(MIMEText(cuerpo, "plain", "utf-8"))
+        if cuerpo_html:
+            mensaje.attach(MIMEText(cuerpo_html, "html", "utf-8"))
+
+    mensaje["Subject"] = asunto
+    mensaje["From"]    = SMTP_FROM
+    mensaje["To"]      = destinatario
+
+    servidor = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
+    servidor.starttls()
+    servidor.login(SMTP_USER, SMTP_PASSWORD)
+    servidor.sendmail(SMTP_USER, [destinatario], mensaje.as_string())
+    servidor.quit()
+
+    print(f"correo enviado correctamente a {destinatario}")
+    return True
+
+
+# =====================================================
+# configuración principal
+# =====================================================
+
+app = Flask(__name__)
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+LOGO_INAMHI_PATH = os.path.join(BASE_DIR, "static", "img", "logo_inamhi.png")
+
+CORS(app, resources={
+    r"/api/*": {
+        "origins": CORS_ORIGINS,
+        "methods": ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        "allow_headers": ["Content-Type", "Authorization"],
+    }
+})
+
+# =====================================================
+# Blueprints registrados
+# =====================================================
+from blueprints.auth_bp import auth_bp
+app.register_blueprint(auth_bp)
+
+# =====================================================
+# permitir preflight CORS global sin token
+# =====================================================
+
+@app.before_request
+def manejar_preflight_cors():
+    if request.method == "OPTIONS":
+        respuesta = jsonify({
+            "estado": "ok",
+            "mensaje": "preflight correcto."
+        })
+
+        respuesta.headers.add("Access-Control-Allow-Origin", request.headers.get("Origin", "*"))
+        respuesta.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        respuesta.headers.add("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+        respuesta.headers.add("Access-Control-Allow-Credentials", "true")
+
+        return respuesta, 200
+
+app.config["MAX_CONTENT_LENGTH"] = 15 * 1024 * 1024  # 15 MB
+
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = int(os.getenv("DB_PORT", 3306))
+DB_USER = os.getenv("DB_USER", "root")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+DB_NAME = os.getenv("DB_NAME", "inamhi_liberacion_web")
+
+JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY", "inamhi_liberacion_web_secret_2026")
+JWT_EXPIRATION_HOURS = int(os.getenv("JWT_EXPIRATION_HOURS", 8))
+
+BACKEND_HOST = os.getenv("BACKEND_HOST", "127.0.0.1")
+BACKEND_PORT = int(os.getenv("BACKEND_PORT", 5050))
+APP_URL = os.getenv("APP_URL", f"http://127.0.0.1:{BACKEND_PORT}")
+
+# =====================================================
+# carpetas de archivos
+# =====================================================
+
+UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
+
+DOCUMENTOS_FOLDER = os.path.join(UPLOAD_FOLDER, "documentos")
+FIRMADOS_FOLDER = os.path.join(UPLOAD_FOLDER, "firmados")
+ESCANEADOS_FOLDER = os.path.join(UPLOAD_FOLDER, "escaneados")
+
+TEMP_CERTS_FOLDER = os.path.join(UPLOAD_FOLDER, "temp_certs")
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(DOCUMENTOS_FOLDER, exist_ok=True)
+os.makedirs(FIRMADOS_FOLDER, exist_ok=True)
+os.makedirs(ESCANEADOS_FOLDER, exist_ok=True)
+os.makedirs(TEMP_CERTS_FOLDER, exist_ok=True)
+os.makedirs(os.path.join(BASE_DIR, "logs"), exist_ok=True)
+
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+app.config["DOCUMENTOS_FOLDER"] = DOCUMENTOS_FOLDER
+app.config["FIRMADOS_FOLDER"] = FIRMADOS_FOLDER
+app.config["ESCANEADOS_FOLDER"] = ESCANEADOS_FOLDER
+app.config["TEMP_CERTS_FOLDER"] = TEMP_CERTS_FOLDER
+
+
+# get_db_connection, limpiar_texto, normalizar_espacios, obtener_ip_cliente
+# ya importados desde utils/ — no se redefinen aquí
+
+
+def validar_solo_letras_espacios(texto):
+    patron = r"^[a-zA-ZáéíóúÁÉÍÓÚñÑüÜ\s]+$"
+    return re.match(patron, texto) is not None
+
+
+def validar_correo_general(correo):
+    correo = limpiar_texto(correo).lower()
+
+    patron_correo = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+
+    return re.match(patron_correo, correo) is not None
+
+
+def validar_cedula_formato(cedula):
+    cedula = limpiar_texto(cedula)
+    return cedula.isdigit() and len(cedula) == 10
+
+
+def validar_telefono_10_digitos(telefono):
+    telefono = limpiar_texto(telefono)
+    return telefono.isdigit() and len(telefono) == 10
+
+
+def validar_ipv4(ip):
+    ip = limpiar_texto(ip)
+
+    try:
+        ipaddress.IPv4Address(ip)
+        return True
+    except Exception:
+        return False
+
+
+def validar_url(url):
+    url = limpiar_texto(url)
+
+    if not url:
+        return False
+
+    if " " in url:
+        return False
+
+    try:
+        resultado = urlparse(url)
+
+        if resultado.scheme not in ["http", "https"]:
+            return False
+
+        if not resultado.netloc:
+            return False
+
+        return True
+
+    except Exception:
+        return False
+
+
+def validar_fecha(fecha):
+    fecha = limpiar_texto(fecha)
+
+    try:
+        datetime.datetime.strptime(fecha, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def convertir_fecha(fecha):
+    return datetime.datetime.strptime(fecha, "%Y-%m-%d").date()
+
+
+def generar_codigo_solicitud():
+    anio = datetime.datetime.now().year
+    prefijo = f"INAMHI-WEB-{anio}-"
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return None
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        sql = """
+            select codigo_solicitud
+            from solicitudes
+            where codigo_solicitud like %s
+            order by id desc
+            limit 1;
+        """
+
+        cursor.execute(sql, (f"{prefijo}%",))
+        ultimo = cursor.fetchone()
+
+        cursor.close()
+        conexion.close()
+
+        if ultimo is None:
+            numero = 1
+        else:
+            codigo_actual = ultimo["codigo_solicitud"]
+            numero_actual = int(codigo_actual.split("-")[-1])
+            numero = numero_actual + 1
+
+        return f"{prefijo}{str(numero).zfill(4)}"
+
+    except Exception as error:
+        print("error al generar código:", error)
+        return None
+
+
+def registrar_auditoria(usuario_id, solicitud_id, modulo, accion, descripcion, datos_anteriores=None, datos_nuevos=None):
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return False
+
+    try:
+        cursor = conexion.cursor()
+
+        sql = """
+            insert into auditoria (
+                usuario_id,
+                solicitud_id,
+                modulo,
+                accion,
+                descripcion,
+                datos_anteriores,
+                datos_nuevos,
+                ip_origen
+            ) values (
+                %s, %s, %s, %s, %s, %s, %s, %s
+            );
+        """
+
+        import json
+
+        cursor.execute(sql, (
+            usuario_id,
+            solicitud_id,
+            modulo,
+            accion,
+            descripcion,
+            json.dumps(datos_anteriores, ensure_ascii=False) if datos_anteriores else None,
+            json.dumps(datos_nuevos, ensure_ascii=False) if datos_nuevos else None,
+            obtener_ip_cliente()
+        ))
+
+        conexion.commit()
+        cursor.close()
+        conexion.close()
+
+        return True
+
+    except Error as error:
+        print("error al registrar auditoría:", error)
+        return False
+
+
+# =====================================================
+# validación fuerte de solicitud pública
+# =====================================================
+
+def validar_solicitud_publica(data):
+    errores = {}
+
+    nombres_completos = normalizar_espacios(data.get("nombres_completos"))
+    cedula = limpiar_texto(data.get("cedula"))
+    correo_institucional = limpiar_texto(data.get("correo_institucional")).lower()
+    telefono_ext = limpiar_texto(data.get("telefono_ext"))
+    dependencia = normalizar_espacios(data.get("dependencia"))
+    area_unidad = normalizar_espacios(data.get("area_unidad"))
+    cargo = normalizar_espacios(data.get("cargo"))
+    fecha_solicitud = limpiar_texto(data.get("fecha_solicitud"))
+    tipo_usuario = limpiar_texto(data.get("tipo_usuario"))
+    nombre_usuario_externo = normalizar_espacios(data.get("nombre_usuario_externo"))
+    direccion_ip = limpiar_texto(data.get("direccion_ip"))
+    tiempo_vigencia_acceso = normalizar_espacios(data.get("tiempo_vigencia_acceso"))
+    justificacion = normalizar_espacios(data.get("justificacion_necesidad_institucional"))
+    paginas_web = data.get("paginas_web")
+
+    # nombres completos
+    if not nombres_completos:
+        errores["nombres_completos"] = "los nombres completos son obligatorios."
+    elif len(nombres_completos) < 5:
+        errores["nombres_completos"] = "los nombres completos deben tener mínimo 5 caracteres."
+    elif len(nombres_completos) > 200:
+        errores["nombres_completos"] = "los nombres completos no pueden superar 200 caracteres."
+    elif not validar_solo_letras_espacios(nombres_completos):
+        errores["nombres_completos"] = "los nombres completos solo pueden contener letras y espacios."
+
+    # cédula
+    if not cedula:
+        errores["cedula"] = "la cédula es obligatoria."
+    elif not validar_cedula_formato(cedula):
+        errores["cedula"] = "la cédula debe contener exactamente 10 números."
+
+    # correo electrónico
+    if not correo_institucional:
+        errores["correo_institucional"] = "el correo electrónico es obligatorio."
+    elif not validar_correo_general(correo_institucional):
+        errores["correo_institucional"] = "ingrese un correo válido. ejemplo: usuario@gmail.com, usuario@outlook.com o usuario@inamhi.gob.ec."
+
+    # teléfono
+    if not telefono_ext:
+        errores["telefono_ext"] = "el teléfono es obligatorio."
+    elif not validar_telefono_10_digitos(telefono_ext):
+        errores["telefono_ext"] = "el teléfono debe contener exactamente 10 números."
+
+    # dependencia
+    if not dependencia:
+        errores["dependencia"] = "la dependencia es obligatoria."
+    elif len(dependencia) < 3:
+        errores["dependencia"] = "la dependencia debe tener mínimo 3 caracteres."
+    elif len(dependencia) > 150:
+        errores["dependencia"] = "la dependencia no puede superar 150 caracteres."
+
+    # área / unidad
+    if not area_unidad:
+        errores["area_unidad"] = "el área o unidad es obligatoria."
+    elif len(area_unidad) < 3:
+        errores["area_unidad"] = "el área o unidad debe tener mínimo 3 caracteres."
+    elif len(area_unidad) > 150:
+        errores["area_unidad"] = "el área o unidad no puede superar 150 caracteres."
+
+    # cargo
+    if not cargo:
+        errores["cargo"] = "el cargo es obligatorio."
+    elif len(cargo) < 3:
+        errores["cargo"] = "el cargo debe tener mínimo 3 caracteres."
+    elif len(cargo) > 150:
+        errores["cargo"] = "el cargo no puede superar 150 caracteres."
+
+    # fecha
+    if not fecha_solicitud:
+        errores["fecha_solicitud"] = "la fecha de solicitud es obligatoria."
+    elif not validar_fecha(fecha_solicitud):
+        errores["fecha_solicitud"] = "la fecha debe tener formato yyyy-mm-dd."
+
+    # tipo usuario
+    tipos_validos = ["funcionario_inamhi", "externo"]
+
+    if not tipo_usuario:
+        errores["tipo_usuario"] = "el tipo de usuario es obligatorio."
+    elif tipo_usuario not in tipos_validos:
+        errores["tipo_usuario"] = "el tipo de usuario solo puede ser funcionario_inamhi o externo."
+
+    # externo
+    if tipo_usuario == "externo":
+        if not nombre_usuario_externo:
+            errores["nombre_usuario_externo"] = "el nombre del usuario externo es obligatorio."
+        elif len(nombre_usuario_externo) < 5:
+            errores["nombre_usuario_externo"] = "el nombre del usuario externo debe tener mínimo 5 caracteres."
+        elif len(nombre_usuario_externo) > 200:
+            errores["nombre_usuario_externo"] = "el nombre del usuario externo no puede superar 200 caracteres."
+
+        if not direccion_ip:
+            errores["direccion_ip"] = "la dirección ip es obligatoria para usuario externo."
+        elif not validar_ipv4(direccion_ip):
+            errores["direccion_ip"] = "la dirección ip debe tener formato ipv4 válido."
+
+    if tipo_usuario == "funcionario_inamhi":
+        if direccion_ip and not validar_ipv4(direccion_ip):
+            errores["direccion_ip"] = "la dirección ip debe tener formato ipv4 válido."
+
+    # vigencia
+    if not tiempo_vigencia_acceso:
+        errores["tiempo_vigencia_acceso"] = "el tiempo de vigencia del acceso es obligatorio."
+    elif len(tiempo_vigencia_acceso) < 3:
+        errores["tiempo_vigencia_acceso"] = "el tiempo de vigencia debe tener mínimo 3 caracteres."
+    elif len(tiempo_vigencia_acceso) > 100:
+        errores["tiempo_vigencia_acceso"] = "el tiempo de vigencia no puede superar 100 caracteres."
+
+    # justificación
+    if not justificacion:
+        errores["justificacion_necesidad_institucional"] = "la justificación es obligatoria."
+    elif len(justificacion) < 20:
+        errores["justificacion_necesidad_institucional"] = "la justificación debe tener mínimo 20 caracteres."
+    elif len(justificacion) > 2000:
+        errores["justificacion_necesidad_institucional"] = "la justificación no puede superar 2000 caracteres."
+
+    # páginas web
+    if not isinstance(paginas_web, list):
+        errores["paginas_web"] = "las páginas web deben enviarse como una lista."
+    else:
+        paginas_limpias = []
+
+        for pagina in paginas_web:
+            if isinstance(pagina, dict):
+                url = limpiar_texto(pagina.get("url_pagina"))
+                descripcion = normalizar_espacios(pagina.get("descripcion"))
+            else:
+                url = limpiar_texto(pagina)
+                descripcion = ""
+
+            if url:
+                paginas_limpias.append({
+                    "url_pagina": url,
+                    "descripcion": descripcion
+                })
+
+        if len(paginas_limpias) < 1:
+            errores["paginas_web"] = "debe ingresar al menos una página web importante."
+        elif len(paginas_limpias) > 8:
+            errores["paginas_web"] = "solo se permiten máximo 8 páginas web."
+        else:
+            for index, pagina in enumerate(paginas_limpias, start=1):
+                if len(pagina["url_pagina"]) > 255:
+                    errores[f"pagina_{index}"] = "la url no puede superar 255 caracteres."
+
+                if len(pagina["descripcion"]) > 255:
+                    errores[f"descripcion_pagina_{index}"] = "la descripción de la página no puede superar 255 caracteres."
+
+    datos_limpios = {
+        "nombres_completos": nombres_completos,
+        "cedula": cedula,
+        "correo_institucional": correo_institucional,
+        "telefono_ext": telefono_ext,
+        "dependencia": dependencia,
+        "area_unidad": area_unidad,
+        "cargo": cargo,
+        "fecha_solicitud": fecha_solicitud,
+        "tipo_usuario": tipo_usuario,
+        "nombre_usuario_externo": nombre_usuario_externo if tipo_usuario == "externo" else None,
+        "direccion_ip": direccion_ip if direccion_ip else None,
+        "tiempo_vigencia_acceso": tiempo_vigencia_acceso,
+        "justificacion_necesidad_institucional": justificacion,
+        "paginas_web": []
+    }
+
+    if isinstance(paginas_web, list):
+        for pagina in paginas_web:
+            if isinstance(pagina, dict):
+                url = limpiar_texto(pagina.get("url_pagina"))
+                descripcion = normalizar_espacios(pagina.get("descripcion"))
+            else:
+                url = limpiar_texto(pagina)
+                descripcion = ""
+
+            if url:
+                datos_limpios["paginas_web"].append({
+                    "url_pagina": url,
+                    "descripcion": descripcion
+                })
+
+    return errores, datos_limpios
+
+
+# crear_hash_password, verificar_password, generar_token, decodificar_token,
+# token_requerido, roles_permitidos, obtener_usuario_por_username,
+# obtener_usuario_por_id, actualizar_ultimo_acceso
+# ya importados desde utils/ — no se redefinen aquí
+
+# =====================================================
+# funciones de usuario (delegadas a utils/user_utils)
+# =====================================================
+
+def obtener_usuario_por_username(username):
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return None
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        sql = """
+            select 
+                u.id,
+                u.rol_id,
+                r.nombre as rol,
+                u.nombres,
+                u.apellidos,
+                u.cedula,
+                u.correo,
+                u.usuario,
+                u.password_hash,
+                u.cargo,
+                u.area_unidad,
+                u.dependencia,
+                u.telefono_ext,
+                u.estado
+            from usuarios u
+            inner join roles r on r.id = u.rol_id
+            where u.usuario = %s
+            limit 1;
+        """
+
+        cursor.execute(sql, (username,))
+        usuario = cursor.fetchone()
+
+        cursor.close()
+        conexion.close()
+
+        return usuario
+
+    except Error as error:
+        print("error al obtener usuario:", error)
+        return None
+
+
+def obtener_usuario_por_id(usuario_id):
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return None
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        sql = """
+            select 
+                u.id,
+                u.rol_id,
+                r.nombre as rol,
+                u.nombres,
+                u.apellidos,
+                u.cedula,
+                u.correo,
+                u.usuario,
+                u.cargo,
+                u.area_unidad,
+                u.dependencia,
+                u.telefono_ext,
+                u.estado,
+                u.ultimo_acceso,
+                u.created_at,
+                u.updated_at
+            from usuarios u
+            inner join roles r on r.id = u.rol_id
+            where u.id = %s
+            limit 1;
+        """
+
+        cursor.execute(sql, (usuario_id,))
+        usuario = cursor.fetchone()
+
+        cursor.close()
+        conexion.close()
+
+        return usuario
+
+    except Error as error:
+        print("error al obtener usuario por id:", error)
+        return None
+
+
+def actualizar_ultimo_acceso(usuario_id):
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return False
+
+    try:
+        cursor = conexion.cursor()
+
+        sql = """
+            update usuarios
+            set ultimo_acceso = now()
+            where id = %s;
+        """
+
+        cursor.execute(sql, (usuario_id,))
+        conexion.commit()
+
+        cursor.close()
+        conexion.close()
+
+        return True
+
+    except Error as error:
+        print("error al actualizar último acceso:", error)
+        return False
+
+
+# =====================================================
+# rutas de prueba
+# =====================================================
+
+@app.route("/", methods=["GET"])
+def inicio():
+    return jsonify({
+        "estado": "ok",
+        "mensaje": "backend inamhi liberación web funcionando correctamente",
+        "puerto": BACKEND_PORT
+    }), 200
+
+
+@app.route("/api/test", methods=["GET"])
+def test():
+    return jsonify({
+        "estado": "ok",
+        "mensaje": "backend del sistema de liberacion web inamhi funcionando correctamente",
+        "sistema": "sistema de gestion de solicitudes de liberacion web",
+        "institucion": "inamhi",
+        "version": "1.0.0",
+        "backend_url": f"http://{BACKEND_HOST}:{BACKEND_PORT}"
+    }), 200
+
+
+@app.route("/api/test-db", methods=["GET"])
+def test_db():
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos mysql",
+            "base_datos": DB_NAME,
+            "host": DB_HOST,
+            "puerto": DB_PORT,
+            "usuario": DB_USER
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("select database() as base_datos;")
+        base = cursor.fetchone()
+
+        cursor.execute("show tables;")
+        tablas = cursor.fetchall()
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "conexión exitosa con mysql",
+            "base_datos": base["base_datos"],
+            "tablas": tablas
+        }), 200
+
+    except Error as error:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al consultar la base de datos",
+            "error": str(error)
+        }), 500
+    
+    # =====================================================
+# prueba de correo SMTP
+# =====================================================
+
+@app.route("/api/test-correo", methods=["GET"])
+def test_correo():
+    try:
+        correo_destino = request.args.get("correo") or SMTP_USER
+
+        enviar_correo(
+            destinatario=correo_destino,
+            asunto="Prueba de correo SMTP - INAMHI",
+            cuerpo="""
+Este es un correo de prueba enviado desde el backend Flask del Sistema de Liberación Web INAMHI.
+
+Si recibió este mensaje, la configuración SMTP funciona correctamente.
+"""
+        )
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "correo de prueba enviado correctamente.",
+            "destinatario": correo_destino
+        }), 200
+
+    except Exception as error:
+        print("ERROR TEST CORREO:", str(error))
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo enviar el correo de prueba.",
+            "error": str(error),
+            "smtp_host": SMTP_HOST,
+            "smtp_port": SMTP_PORT,
+            "smtp_user_configurado": bool(SMTP_USER),
+            "smtp_password_configurado": bool(SMTP_PASSWORD),
+            "smtp_from": SMTP_FROM
+        }), 500
+
+
+# =====================================================
+# solicitud pública
+# =====================================================
+
+@app.route("/api/public/solicitudes", methods=["POST"])
+def registrar_solicitud_publica():
+    data = request.get_json()
+
+    if not data:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se recibieron datos para registrar la solicitud."
+        }), 400
+
+    errores, datos = validar_solicitud_publica(data)
+
+    if errores:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "existen errores de validación en el formulario.",
+            "errores": errores
+        }), 400
+
+    codigo_solicitud = generar_codigo_solicitud()
+
+    if codigo_solicitud is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo generar el código de solicitud."
+        }), 500
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor()
+
+        sql_solicitud = """
+            insert into solicitudes (
+                codigo_solicitud,
+                nombres_completos,
+                cedula,
+                correo_institucional,
+                telefono_ext,
+                dependencia,
+                area_unidad,
+                cargo,
+                fecha_solicitud,
+                tipo_usuario,
+                nombre_usuario_externo,
+                direccion_ip,
+                tiempo_vigencia_acceso,
+                justificacion_necesidad_institucional,
+                estado,
+                etapa_actual,
+                bloqueada
+            ) values (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                'pendiente_firma_solicitante',
+                'firma_solicitante',
+                false
+            );
+        """
+
+        valores_solicitud = (
+            codigo_solicitud,
+            datos["nombres_completos"],
+            datos["cedula"],
+            datos["correo_institucional"],
+            datos["telefono_ext"],
+            datos["dependencia"],
+            datos["area_unidad"],
+            datos["cargo"],
+            convertir_fecha(datos["fecha_solicitud"]),
+            datos["tipo_usuario"],
+            datos["nombre_usuario_externo"],
+            datos["direccion_ip"],
+            datos["tiempo_vigencia_acceso"],
+            datos["justificacion_necesidad_institucional"]
+        )
+
+        cursor.execute(sql_solicitud, valores_solicitud)
+        solicitud_id = cursor.lastrowid
+
+        sql_pagina = """
+            insert into solicitud_paginas_web (
+                solicitud_id,
+                numero,
+                url_pagina,
+                descripcion
+            ) values (
+                %s, %s, %s, %s
+            );
+        """
+
+        for index, pagina in enumerate(datos["paginas_web"], start=1):
+            cursor.execute(sql_pagina, (
+                solicitud_id,
+                index,
+                pagina["url_pagina"],
+                pagina["descripcion"]
+            ))
+
+        conexion.commit()
+
+        cursor.close()
+        conexion.close()
+
+        registrar_auditoria(
+            usuario_id=None,
+            solicitud_id=solicitud_id,
+            modulo="solicitud_publica",
+            accion="crear_solicitud",
+            descripcion=f"solicitud pública creada con código {codigo_solicitud}",
+            datos_anteriores=None,
+            datos_nuevos={
+                "codigo_solicitud": codigo_solicitud,
+                "nombres_completos": datos["nombres_completos"],
+                "cedula": datos["cedula"],
+                "correo_institucional": datos["correo_institucional"],
+                "estado": "pendiente_firma_solicitante",
+                "etapa_actual": "firma_solicitante"
+            }
+        )
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "solicitud registrada correctamente.",
+            "solicitud": {
+                "id": solicitud_id,
+                "codigo_solicitud": codigo_solicitud,
+                "estado": "pendiente_firma_solicitante",
+                "etapa_actual": "firma_solicitante",
+                "nombres_completos": datos["nombres_completos"],
+                "correo_institucional": datos["correo_institucional"]
+            }
+        }), 201
+
+    except Error as error:
+        conexion.rollback()
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al registrar la solicitud.",
+            "error": str(error)
+        }), 500
+
+
+@app.route("/api/public/solicitudes/seguimiento/<codigo>", methods=["GET"])
+def seguimiento_solicitud_publica(codigo):
+    codigo = limpiar_texto(codigo).upper()
+
+    if not codigo:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el código de solicitud es obligatorio."
+        }), 400
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        sql = """
+            select
+                id,
+                codigo_solicitud,
+                nombres_completos,
+                cedula,
+                correo_institucional,
+                dependencia,
+                area_unidad,
+                cargo,
+                fecha_solicitud,
+                tipo_usuario,
+                tiempo_vigencia_acceso,
+                justificacion_necesidad_institucional,
+                estado,
+                etapa_actual,
+                bloqueada,
+                created_at,
+                updated_at
+            from solicitudes
+            where codigo_solicitud = %s
+            limit 1;
+        """
+
+        cursor.execute(sql, (codigo,))
+        solicitud = cursor.fetchone()
+
+        if solicitud is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no se encontró una solicitud con ese código."
+            }), 404
+
+        sql_paginas = """
+            select numero, url_pagina, descripcion
+            from solicitud_paginas_web
+            where solicitud_id = %s
+            order by numero asc;
+        """
+
+        cursor.execute(sql_paginas, (solicitud["id"],))
+        paginas = cursor.fetchall()
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "solicitud": solicitud,
+            "paginas_web": paginas
+        }), 200
+
+    except Error as error:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al consultar la solicitud.",
+            "error": str(error)
+        }), 500
+
+
+# =====================================================
+# ruta temporal para generar contraseñas reales
+# eliminar o comentar después de usar
+# =====================================================
+
+@app.route("/api/dev/reset-passwords", methods=["GET"])
+def reset_passwords():
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con mysql"
+        }), 500
+
+    usuarios_passwords = [
+        ("admin", "admin123"),
+        ("jefe", "jefe123"),
+        ("autoridad", "autoridad123"),
+        ("tics", "tics123")
+    ]
+
+    try:
+        cursor = conexion.cursor()
+
+        for username, password in usuarios_passwords:
+            password_hash = crear_hash_password(password)
+
+            sql = """
+                update usuarios
+                set password_hash = %s
+                where usuario = %s;
+            """
+
+            cursor.execute(sql, (password_hash, username))
+
+        conexion.commit()
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "contraseñas actualizadas correctamente",
+            "usuarios": [
+                {
+                    "usuario": "admin",
+                    "password": "admin123"
+                },
+                {
+                    "usuario": "jefe",
+                    "password": "jefe123"
+                },
+                {
+                    "usuario": "autoridad",
+                    "password": "autoridad123"
+                },
+                {
+                    "usuario": "tics",
+                    "password": "tics123"
+                }
+            ],
+            "advertencia": "esta ruta es temporal. después de usarla, se recomienda comentarla o eliminarla."
+        }), 200
+
+    except Error as error:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al actualizar contraseñas",
+            "error": str(error)
+        }), 500
+
+
+# =====================================================
+# autenticación
+# =====================================================
+
+# /api/auth/login y /api/auth/me → migrados a blueprints/auth_bp.py
+
+
+@app.route("/api/admin/test", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador")
+def admin_test():
+    return jsonify({
+        "estado": "ok",
+        "mensaje": "acceso permitido solo para administrador",
+        "usuario": request.usuario_actual
+    }), 200
+
+
+@app.route("/api/tics/test", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador", "analista_tics")
+def tics_test():
+    return jsonify({
+        "estado": "ok",
+        "mensaje": "acceso permitido para administrador o analista tics",
+        "usuario": request.usuario_actual
+    }), 200
+
+
+# =====================================================
+# solicitudes asignadas por rol
+# =====================================================
+
+@app.route("/api/mis-solicitudes", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics")
+def listar_mis_solicitudes():
+    usuario_actual = request.usuario_actual
+    rol_actual = usuario_actual["rol"]
+    usuario_id = usuario_actual["id"]
+
+    busqueda = limpiar_texto(request.args.get("q"))
+
+    reglas_por_rol = {
+        "administrador": {
+            "estados": [
+                "pendiente_firma_solicitante",
+                "pendiente_jefe_inmediato",
+                "pendiente_maxima_autoridad",
+                "pendiente_tics",
+                "pendiente_ejecucion_tics",
+                "finalizada",
+                "rechazada_jefe_inmediato",
+                "rechazada_maxima_autoridad",
+                "rechazada_tics",
+                "anulada"
+            ],
+            "etapas": None
+        },
+        "jefe_inmediato": {
+            "estados": ["pendiente_jefe_inmediato"],
+            "etapas": ["jefe_inmediato"]
+        },
+        "maxima_autoridad": {
+            "estados": ["pendiente_maxima_autoridad"],
+            "etapas": ["maxima_autoridad"]
+        },
+        "analista_tics": {
+            "estados": ["pendiente_tics", "pendiente_ejecucion_tics"],
+            "etapas": ["tics", "ejecucion_tics"]
+        }
+    }
+
+    regla = reglas_por_rol.get(rol_actual)
+
+    if regla is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el rol actual no tiene solicitudes asignadas.",
+            "rol": rol_actual
+        }), 403
+
+    estados_permitidos = regla["estados"]
+    etapas_permitidas = regla["etapas"]
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        condiciones = []
+        parametros = []
+
+        # =====================================================
+        # filtro por estado
+        # =====================================================
+
+        placeholders_estados = ", ".join(["%s"] * len(estados_permitidos))
+        condiciones.append(f"s.estado in ({placeholders_estados})")
+        parametros.extend(estados_permitidos)
+
+        # =====================================================
+        # filtro por etapa
+        # =====================================================
+
+        if etapas_permitidas:
+            placeholders_etapas = ", ".join(["%s"] * len(etapas_permitidas))
+            condiciones.append(f"s.etapa_actual in ({placeholders_etapas})")
+            parametros.extend(etapas_permitidas)
+
+        # =====================================================
+        # filtro especial para jefe inmediato
+        # cada jefe ve solo las solicitudes asignadas a su usuario
+        # =====================================================
+
+        if rol_actual == "jefe_inmediato":
+            condiciones.append("s.jefe_asignado_id = %s")
+            parametros.append(usuario_id)
+
+        # =====================================================
+        # búsqueda general
+        # =====================================================
+
+        if busqueda:
+            condiciones.append("""
+                (
+                    s.codigo_solicitud like %s or
+                    s.nombres_completos like %s or
+                    s.cedula like %s or
+                    s.correo_institucional like %s or
+                    s.area_unidad like %s or
+                    s.dependencia like %s or
+                    s.cargo like %s
+                )
+            """)
+
+            valor_busqueda = f"%{busqueda}%"
+
+            parametros.extend([
+                valor_busqueda,
+                valor_busqueda,
+                valor_busqueda,
+                valor_busqueda,
+                valor_busqueda,
+                valor_busqueda,
+                valor_busqueda
+            ])
+
+        where_sql = " and ".join(condiciones)
+
+        sql = f"""
+            select
+                s.id,
+                s.direccion_id,
+                s.area_id,
+                s.cargo_id,
+                s.jefe_asignado_id,
+                s.maxima_autoridad_id,
+                s.codigo_solicitud,
+                s.nombres_completos,
+                s.cedula,
+                s.correo_institucional,
+                s.telefono_ext,
+                s.dependencia,
+                s.area_unidad,
+                s.cargo,
+                s.fecha_solicitud,
+                s.tipo_usuario,
+                s.nombre_usuario_externo,
+                s.direccion_ip,
+                s.tiempo_vigencia_acceso,
+                s.justificacion_necesidad_institucional,
+                s.estado,
+                s.etapa_actual,
+                s.bloqueada,
+                s.created_at,
+                s.updated_at,
+
+                (
+                    select count(*)
+                    from solicitud_paginas_web p
+                    where p.solicitud_id = s.id
+                ) as total_paginas,
+
+                (
+                    select concat(p.nombres, ' ', ifnull(p.apellidos, ''))
+                    from area_personal p
+                    where p.area_id = s.area_id
+                      and p.tipo_responsable = 'jefe_area'
+                      and p.estado = 'activo'
+                    order by p.id asc
+                    limit 1
+                ) as nombre_jefe_area
+
+            from solicitudes s
+            where {where_sql}
+            order by s.id desc;
+        """
+
+        cursor.execute(sql, tuple(parametros))
+        solicitudes = cursor.fetchall()
+
+        for solicitud in solicitudes:
+            solicitud["fecha_solicitud"] = serializar_fecha(solicitud["fecha_solicitud"])
+            solicitud["created_at"] = serializar_fecha(solicitud["created_at"])
+            solicitud["updated_at"] = serializar_fecha(solicitud["updated_at"])
+            solicitud["bloqueada"] = bool(solicitud["bloqueada"]) if solicitud["bloqueada"] is not None else False
+            solicitud["total_paginas"] = int(solicitud["total_paginas"] or 0)
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "solicitudes asignadas obtenidas correctamente.",
+            "rol": rol_actual,
+            "usuario_id": usuario_id,
+            "total": len(solicitudes),
+            "solicitudes": solicitudes
+        }), 200
+
+    except Error as error:
+        print("error al obtener solicitudes asignadas:", error)
+
+        try:
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al obtener solicitudes asignadas.",
+            "error": str(error)
+        }), 500
+# =====================================================
+# solicitudes administrativas
+# =====================================================
+
+def serializar_fecha(valor):
+    if valor is None:
+        return None
+
+    if isinstance(valor, (datetime.datetime, datetime.date)):
+        return valor.strftime("%Y-%m-%d %H:%M:%S")
+
+    return str(valor)
+
+
+@app.route("/api/admin/solicitudes", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador", "analista_tics", "jefe_inmediato", "maxima_autoridad")
+def listar_solicitudes_admin():
+    estado = limpiar_texto(request.args.get("estado"))
+    busqueda = limpiar_texto(request.args.get("q"))
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        condiciones = []
+        parametros = []
+
+        if estado:
+            condiciones.append("s.estado = %s")
+            parametros.append(estado)
+
+        if busqueda:
+            condiciones.append("""
+                (
+                    s.codigo_solicitud like %s or
+                    s.nombres_completos like %s or
+                    s.cedula like %s or
+                    s.correo_institucional like %s or
+                    s.area_unidad like %s or
+                    s.dependencia like %s
+                )
+            """)
+
+            valor_busqueda = f"%{busqueda}%"
+            parametros.extend([
+                valor_busqueda,
+                valor_busqueda,
+                valor_busqueda,
+                valor_busqueda,
+                valor_busqueda,
+                valor_busqueda
+            ])
+
+        where_sql = ""
+
+        if condiciones:
+            where_sql = "where " + " and ".join(condiciones)
+
+        sql = f"""
+            select
+                s.id,
+                s.codigo_solicitud,
+                s.nombres_completos,
+                s.cedula,
+                s.correo_institucional,
+                s.telefono_ext,
+                s.dependencia,
+                s.area_unidad,
+                s.cargo,
+                s.fecha_solicitud,
+                s.tipo_usuario,
+                s.nombre_usuario_externo,
+                s.direccion_ip,
+                s.tiempo_vigencia_acceso,
+                s.justificacion_necesidad_institucional,
+                s.estado,
+                s.etapa_actual,
+                s.bloqueada,
+                s.created_at,
+                s.updated_at,
+                count(p.id) as total_paginas
+            from solicitudes s
+            left join solicitud_paginas_web p on p.solicitud_id = s.id
+            {where_sql}
+            group by s.id
+            order by s.id desc;
+        """
+
+        cursor.execute(sql, tuple(parametros))
+        solicitudes = cursor.fetchall()
+
+        for solicitud in solicitudes:
+            solicitud["fecha_solicitud"] = serializar_fecha(solicitud["fecha_solicitud"])
+            solicitud["created_at"] = serializar_fecha(solicitud["created_at"])
+            solicitud["updated_at"] = serializar_fecha(solicitud["updated_at"])
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "solicitudes obtenidas correctamente.",
+            "total": len(solicitudes),
+            "solicitudes": solicitudes
+        }), 200
+
+    except Error as error:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al obtener solicitudes.",
+            "error": str(error)
+        }), 500
+
+
+# =====================================================
+# generación de PDF A4 de solicitud
+# =====================================================
+
+def obtener_solicitud_completa_para_pdf(solicitud_id):
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return None, [], "no se pudo conectar con la base de datos."
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        sql_solicitud = """
+            select
+                s.id,
+                s.direccion_id,
+                s.area_id,
+                s.cargo_id,
+                s.jefe_asignado_id,
+                s.maxima_autoridad_id,
+                s.codigo_solicitud,
+                s.nombres_completos,
+                s.cedula,
+                s.correo_institucional,
+                s.telefono_ext,
+                s.dependencia,
+                s.area_unidad,
+                s.cargo,
+                s.fecha_solicitud,
+                s.tipo_usuario,
+                s.nombre_usuario_externo,
+                s.direccion_ip,
+                s.tiempo_vigencia_acceso,
+                s.justificacion_necesidad_institucional,
+                s.estado,
+                s.etapa_actual,
+                s.bloqueada,
+                s.created_at,
+                s.updated_at,
+
+                (
+                    select concat(p.nombres, ' ', ifnull(p.apellidos, ''))
+                    from area_personal p
+                    where p.area_id = s.area_id
+                      and p.tipo_responsable = 'jefe_area'
+                      and p.estado = 'activo'
+                    order by p.id asc
+                    limit 1
+                ) as nombre_jefe_area,
+
+                (
+                    select concat(u.nombres, ' ', ifnull(u.apellidos, ''))
+                    from usuarios u
+                    inner join roles r on r.id = u.rol_id
+                    where r.nombre = 'maxima_autoridad'
+                      and u.estado = 'activo'
+                    order by u.id asc
+                    limit 1
+                ) as nombre_maxima_autoridad,
+
+                (
+                    select concat(u.nombres, ' ', ifnull(u.apellidos, ''))
+                    from usuarios u
+                    inner join roles r on r.id = u.rol_id
+                    where r.nombre = 'analista_tics'
+                      and u.estado = 'activo'
+                    order by u.id asc
+                    limit 1
+                ) as nombre_encargado_tics
+
+            from solicitudes s
+            where s.id = %s
+            limit 1;
+        """
+
+        cursor.execute(sql_solicitud, (solicitud_id,))
+        solicitud = cursor.fetchone()
+
+        if solicitud is None:
+            cursor.close()
+            conexion.close()
+            return None, [], "solicitud no encontrada."
+
+        sql_paginas = """
+            select
+                numero,
+                url_pagina,
+                descripcion
+            from solicitud_paginas_web
+            where solicitud_id = %s
+            order by numero asc;
+        """
+
+        cursor.execute(sql_paginas, (solicitud_id,))
+        paginas_web = cursor.fetchall()
+
+        cursor.close()
+        conexion.close()
+
+        return solicitud, paginas_web, None
+
+    except Error as error:
+        return None, [], str(error)
+
+
+def texto_seguro(valor):
+    if valor is None:
+        return ""
+
+    texto = str(valor)
+    texto = texto.replace("&", "&amp;")
+    texto = texto.replace("<", "&lt;")
+    texto = texto.replace(">", "&gt;")
+    return texto
+
+
+def valor_pdf_seguro(solicitud, campo, modo_pdf="electronico", limite=None):
+    """
+    En modo manual devuelve vacío.
+    En modo electrónico devuelve el valor real de la solicitud.
+    """
+
+    if modo_pdf == "manual":
+        return ""
+
+    if not isinstance(solicitud, dict):
+        return ""
+
+    valor = texto_seguro(solicitud.get(campo, ""))
+
+    if limite:
+        return valor[:limite]
+
+    return valor
+
+
+    
+    
+
+
+def estado_legible_pdf(estado):
+    estados = {
+        "pendiente_firma_solicitante": "Pendiente firma solicitante",
+        "pendiente_jefe_inmediato": "Pendiente jefe inmediato",
+        "rechazada_jefe_inmediato": "Rechazada jefe inmediato",
+        "pendiente_maxima_autoridad": "Pendiente máxima autoridad",
+        "rechazada_maxima_autoridad": "Rechazada máxima autoridad",
+        "pendiente_tics": "Pendiente validación TICS",
+        "rechazada_tics": "Rechazada TICS",
+        "pendiente_ejecucion_tics": "Pendiente ejecución TICS",
+        "finalizada": "Finalizada",
+        "anulada": "Anulada",
+        "pendiente_subida_manual": "Pendiente subida manual"
+    }
+
+    return estados.get(estado, estado)
+
+
+def etapa_legible_pdf(etapa):
+    etapas = {
+        "registro_publico": "Registro público",
+        "firma_solicitante": "Firma del solicitante",
+        "jefe_inmediato": "Jefe inmediato",
+        "maxima_autoridad": "Máxima autoridad",
+        "tics": "Validación TICS",
+        "ejecucion_tics": "Ejecución TICS",
+        "finalizado": "Finalizado",
+        "proceso_manual": "Proceso manual"
+    }
+
+    return etapas.get(etapa, etapa)
+
+
+def agregar_titulo_seccion(elementos, titulo, estilos):
+    tabla = Table(
+        [[Paragraph(f"<b>{titulo}</b>", estilos["section_title"])]],
+        colWidths=[17.4 * cm],
+        rowHeights=[0.55 * cm]
+    )
+
+    tabla.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#dbeafe")),
+        ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#1e3a8a")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+
+    elementos.append(tabla)
+
+    
+
+
+def _nombre_firma_html(nombre):
+    # columna de 4.35 cm: a 6.7pt bold caben ~30 chars por línea;
+    # si el nombre es largo se reduce el tamaño para que entre en una sola línea
+    # y la fila no se expanda
+    if len(nombre) > 30:
+        return f'<font size="5.2"><b>{nombre}</b></font>'
+    return f"<b>{nombre}</b>"
+
+
+def agregar_espacios_firmas(elementos, estilos, solicitud=None, modo_pdf="electronico"):
+    agregar_titulo_seccion(
+        elementos,
+        "5. FIRMAS DE RESPONSABILIDAD Y APROBACIÓN",
+        estilos
+    )
+
+    solicitud = solicitud or {}
+
+    if modo_pdf == "manual":
+        celda_firma = (
+            "___________________________<br/><br/><br/>"
+            "Nombre:<br/><br/>"
+            "Cargo:<br/>"
+        )
+        data = [
+            [
+                Paragraph("<b>SOLICITANTE</b>", estilos["center_bold"]),
+                Paragraph("<b>JEFE INMEDIATO</b>", estilos["center_bold"]),
+                Paragraph("<b>MÁXIMA AUTORIDAD</b>", estilos["center_bold"]),
+                Paragraph("<b>TICS</b>", estilos["center_bold"])
+            ],
+            [
+                Paragraph(celda_firma, estilos["mini"]),
+                Paragraph(celda_firma, estilos["mini"]),
+                Paragraph(celda_firma, estilos["mini"]),
+                Paragraph(celda_firma, estilos["mini"]),
+            ]
+        ]
+        row_heights = [1.58 * cm, 3.15 * cm]
+    else:
+        nombre_solicitante = texto_seguro(
+            solicitud.get("nombres_completos") or ""
+        )
+        nombre_jefe = texto_seguro(
+            solicitud.get("nombre_jefe_area") or "Jefe inmediato"
+        )
+        nombre_autoridad = texto_seguro(
+            solicitud.get("nombre_maxima_autoridad") or "Máxima autoridad institucional"
+        )
+        nombre_tics = texto_seguro(
+            solicitud.get("nombre_encargado_tics") or "Encargado TICS"
+        )
+        data = [
+            [
+                Paragraph("<b>SOLICITANTE</b>", estilos["center_bold"]),
+                Paragraph("<b>JEFE INMEDIATO</b>", estilos["center_bold"]),
+                Paragraph("<b>MÁXIMA AUTORIDAD</b>", estilos["center_bold"]),
+                Paragraph("<b>TICS</b>", estilos["center_bold"])
+            ],
+            [
+                Paragraph("_________________________", estilos["center"]),
+                Paragraph("_________________________", estilos["center"]),
+                Paragraph("_________________________", estilos["center"]),
+                Paragraph("_________________________", estilos["center"])
+            ],
+            [
+                Paragraph(_nombre_firma_html(nombre_solicitante), estilos["center"]),
+                Paragraph(_nombre_firma_html(nombre_jefe), estilos["center"]),
+                Paragraph(_nombre_firma_html(nombre_autoridad), estilos["center"]),
+                Paragraph(_nombre_firma_html(nombre_tics), estilos["center"])
+            ]
+        ]
+        row_heights = [1.58 * cm, 2.0 * cm, None]
+
+    tabla = Table(
+        data,
+        colWidths=[4.35 * cm, 4.35 * cm, 4.35 * cm, 4.35 * cm],
+        rowHeights=row_heights
+    )
+
+    if modo_pdf == "manual":
+        tabla.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#111827")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#374151")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eff6ff")),
+            ("VALIGN", (0, 0), (-1, 0), "MIDDLE"),
+            ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+            ("VALIGN", (0, 1), (-1, 1), "BOTTOM"),
+            ("ALIGN", (0, 1), (-1, 1), "LEFT"),
+            ("LEFTPADDING", (0, 1), (-1, 1), 6),
+            ("TOPPADDING", (0, 0), (-1, 0), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
+            ("TOPPADDING", (0, 1), (-1, 1), 6),
+            ("BOTTOMPADDING", (0, 1), (-1, 1), 4),
+        ]))
+    else:
+        tabla.setStyle(TableStyle([
+            ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#111827")),
+            ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#374151")),
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eff6ff")),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, 0), "MIDDLE"),
+            ("VALIGN", (0, 1), (-1, 1), "BOTTOM"),
+            ("VALIGN", (0, 2), (-1, 2), "TOP"),
+            ("TOPPADDING", (0, 0), (-1, 0), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, 0), 4),
+            ("TOPPADDING", (0, 1), (-1, 1), 4),
+            ("BOTTOMPADDING", (0, 1), (-1, 1), 2),
+            ("TOPPADDING", (0, 2), (-1, 2), 2),
+            ("BOTTOMPADDING", (0, 2), (-1, 2), 4),
+        ]))
+
+    elementos.append(tabla)
+    elementos.append(Spacer(1, 0.22 * cm))
+
+
+def agregar_seccion_tics_vertical_compacta(elementos, estilos):
+    titulo = Table(
+        [[
+            Paragraph("<b>6</b>", estilos["number_box"]),
+            Paragraph(
+                "<b>PARA USO EXCLUSIVO DE LA UNIDAD DE TICS</b><br/>"
+                "<font size='7'>GESTIÓN DE SEGURIDAD DE TIC'S</font>",
+                estilos["center_bold"]
+            )
+        ]],
+        colWidths=[1.2 * cm, 16.2 * cm],
+        rowHeights=[0.85 * cm]
+    )
+
+    titulo.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#111827")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#374151")),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#d1d5db")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+
+    elementos.append(titulo)
+
+    autorizacion = Table(
+        [[
+            Paragraph("<b>AUTORIZACIÓN:</b>", estilos["mini_bold"]),
+            Paragraph("Campo validado por TICS", estilos["mini"]),
+            Paragraph("☐ Aprobar", estilos["mini"]),
+            Paragraph("☐ Rechazar", estilos["mini"])
+        ]],
+        colWidths=[3.2 * cm, 6.2 * cm, 4 * cm, 4 * cm],
+        rowHeights=[0.70 * cm]
+    )
+
+    autorizacion.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#111827")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#374151")),
+        ("BACKGROUND", (0, 0), (0, 0), colors.HexColor("#f3f4f6")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+
+    elementos.append(autorizacion)
+
+    observacion = Table(
+        [[
+            Paragraph("<b>OBSERVACIÓN:</b>", estilos["mini_bold"]),
+            Paragraph("", estilos["mini"])
+        ]],
+        colWidths=[3.2 * cm, 14.2 * cm],
+        rowHeights=[1.15 * cm]
+    )
+
+    observacion.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#111827")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#374151")),
+        ("BACKGROUND", (0, 0), (0, 0), colors.HexColor("#f3f4f6")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+
+    elementos.append(observacion)
+
+    firmas_tics = Table(
+        [[
+            Paragraph("Nombre: _______________________<br/><b>Coordinador TICS</b>", estilos["center"]),
+            Paragraph("Fecha: _______________________<br/><b>Responsable ejecución</b>", estilos["center"]),
+            Paragraph("Nombre: _______________________<br/><b>Admin Firewall INAMHI</b>", estilos["center"])
+        ]],
+        colWidths=[5.8 * cm, 5.8 * cm, 5.8 * cm],
+        rowHeights=[1.45 * cm]
+    )
+
+    firmas_tics.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#111827")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#374151")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+
+    elementos.append(firmas_tics)
+
+    nota = Paragraph(
+        "<b>Nota:</b> Documento de uso institucional. Debe conservarse con las firmas y validaciones correspondientes.",
+        estilos["mini"]
+    )
+
+    elementos.append(Spacer(1, 0.12 * cm))
+    elementos.append(nota)
+
+
+def generar_pdf_solicitud_a4(solicitud, paginas_web, incluir_seccion_tics=False, modo_pdf="electronico"):
+    if isinstance(solicitud, dict):
+        modo_pdf = solicitud.get("modo_pdf", modo_pdf)
+
+    buffer = BytesIO()
+
+    documento = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=0.85 * cm,
+        leftMargin=0.85 * cm,
+        topMargin=0.75 * cm,
+        bottomMargin=0.75 * cm
+    )
+
+    styles = getSampleStyleSheet()
+
+    estilos = {
+        "title": ParagraphStyle(
+            "title",
+            parent=styles["Title"],
+            fontName="Helvetica-Bold",
+            fontSize=12,
+            leading=14,
+            alignment=1,
+            textColor=colors.HexColor("#111827")
+        ),
+        "subtitle": ParagraphStyle(
+            "subtitle",
+            parent=styles["Normal"],
+            fontSize=7.5,
+            leading=9,
+            alignment=1,
+            textColor=colors.HexColor("#475569")
+        ),
+        "section_title": ParagraphStyle(
+            "section_title",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=8,
+            leading=10,
+            alignment=1,
+            textColor=colors.HexColor("#0f172a")
+        ),
+        "cell_label": ParagraphStyle(
+            "cell_label",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=7,
+            leading=8.5,
+            textColor=colors.HexColor("#0f172a")
+        ),
+        "cell_text": ParagraphStyle(
+            "cell_text",
+            parent=styles["Normal"],
+            fontSize=7,
+            leading=8.5,
+            textColor=colors.HexColor("#111827")
+        ),
+        "mini": ParagraphStyle(
+            "mini",
+            parent=styles["Normal"],
+            fontSize=6.4,
+            leading=7.4,
+            textColor=colors.HexColor("#111827")
+        ),
+        "mini_bold": ParagraphStyle(
+            "mini_bold",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=6.4,
+            leading=7.4,
+            textColor=colors.HexColor("#111827")
+        ),
+        "center": ParagraphStyle(
+            "center",
+            parent=styles["Normal"],
+            fontSize=6.7,
+            leading=8,
+            alignment=1,
+            textColor=colors.HexColor("#111827")
+        ),
+        "center_bold": ParagraphStyle(
+            "center_bold",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=6.8,
+            leading=8.2,
+            alignment=1,
+            textColor=colors.HexColor("#111827")
+        ),
+        "number_box": ParagraphStyle(
+            "number_box",
+            parent=styles["Normal"],
+            fontName="Helvetica-Bold",
+            fontSize=11,
+            leading=12,
+            alignment=1
+        )
+    }
+
+    elementos = []
+
+    # =====================================================
+    # encabezado con logo
+    # =====================================================
+
+    try:
+        if os.path.exists(LOGO_INAMHI_PATH):
+            logo = Image(LOGO_INAMHI_PATH, width=1.8 * cm, height=1.8 * cm)
+        else:
+            logo = Paragraph("<b>INAMHI</b>", estilos["center_bold"])
+    except Exception:
+        logo = Paragraph("<b>INAMHI</b>", estilos["center_bold"])
+
+    encabezado = Table(
+        [[
+            logo,
+            Paragraph("<b>SOLICITUD DE LIBERACIÓN WEB INSTITUCIONAL</b>", estilos["title"]),
+            Paragraph(
+                f"<b>Código:</b><br/>{texto_seguro(solicitud['codigo_solicitud'])}",
+                estilos["subtitle"]
+            )
+        ]],
+        colWidths=[2.6 * cm, 10.8 * cm, 4.0 * cm],
+        rowHeights=[1.9 * cm]
+    )
+
+    encabezado.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.9, colors.HexColor("#111827")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#374151")),
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#eaf2fb")),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 6),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+    ]))
+
+    elementos.append(encabezado)
+    elementos.append(Spacer(1, 0.22 * cm))
+
+    # =====================================================
+    # 1. datos del solicitante
+    # =====================================================
+
+    agregar_titulo_seccion(elementos, "1. DATOS DEL SOLICITANTE", estilos)
+
+    datos_solicitante = [
+    [
+        Paragraph("<b>Nombres</b>", estilos["cell_label"]),
+        Paragraph(valor_pdf_seguro(solicitud, "nombres_completos", modo_pdf, 90), estilos["cell_text"]),
+        Paragraph("<b>Cédula</b>", estilos["cell_label"]),
+        Paragraph(valor_pdf_seguro(solicitud, "cedula", modo_pdf), estilos["cell_text"]),
+    ],
+    [
+        Paragraph("<b>Correo</b>", estilos["cell_label"]),
+        Paragraph(valor_pdf_seguro(solicitud, "correo_institucional", modo_pdf, 80), estilos["cell_text"]),
+        Paragraph("<b>Teléfono</b>", estilos["cell_label"]),
+        Paragraph(valor_pdf_seguro(solicitud, "telefono_ext", modo_pdf), estilos["cell_text"]),
+    ],
+    [
+        Paragraph("<b>Dependencia</b>", estilos["cell_label"]),
+        Paragraph(valor_pdf_seguro(solicitud, "dependencia", modo_pdf, 80), estilos["cell_text"]),
+        Paragraph("<b>Área</b>", estilos["cell_label"]),
+        Paragraph(valor_pdf_seguro(solicitud, "area_unidad", modo_pdf, 80), estilos["cell_text"]),
+    ],
+    [
+        Paragraph("<b>Cargo</b>", estilos["cell_label"]),
+        Paragraph(valor_pdf_seguro(solicitud, "cargo", modo_pdf, 80), estilos["cell_text"]),
+        Paragraph("<b>Fecha</b>", estilos["cell_label"]),
+        Paragraph(valor_pdf_seguro(solicitud, "fecha_solicitud", modo_pdf), estilos["cell_text"]),
+    ],
+]
+
+    tabla_solicitante = Table(
+    datos_solicitante,
+    colWidths=[2.3 * cm, 6.4 * cm, 2.3 * cm, 6.4 * cm],
+    rowHeights=[0.50 * cm, 0.50 * cm, 0.50 * cm, 0.50 * cm]
+)
+
+    tabla_solicitante.setStyle(TableStyle([
+    ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#111827")),
+    ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#374151")),
+    ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f8fafc")),
+    ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#f8fafc")),
+    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ("TOPPADDING", (0, 0), (-1, -1), 4),
+    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+]))
+
+    elementos.append(tabla_solicitante)
+    elementos.append(Spacer(1, 0.18 * cm)) 
+
+    # =====================================================
+    # 2. información del acceso
+    # =====================================================
+
+    agregar_titulo_seccion(elementos, "2. INFORMACIÓN DEL ACCESO SOLICITADO", estilos)
+
+    datos_acceso = [
+    [
+        Paragraph("<b>Tipo usuario</b>", estilos["cell_label"]),
+        Paragraph(valor_pdf_seguro(solicitud, "tipo_usuario", modo_pdf, 70), estilos["cell_text"]),
+        Paragraph("<b>Usuario externo</b>", estilos["cell_label"]),
+        Paragraph(
+            "" if modo_pdf == "manual" else texto_seguro(solicitud.get("nombre_usuario_externo") or "No aplica")[:70],
+            estilos["cell_text"]
+        ),
+    ],
+    [
+        Paragraph("<b>IP</b>", estilos["cell_label"]),
+        Paragraph(
+            "" if modo_pdf == "manual" else texto_seguro(solicitud.get("direccion_ip") or "No registrada"),
+            estilos["cell_text"]
+        ),
+        Paragraph("<b>Vigencia</b>", estilos["cell_label"]),
+        Paragraph(valor_pdf_seguro(solicitud, "tiempo_vigencia_acceso", modo_pdf, 70), estilos["cell_text"]),
+    ],
+    [
+        Paragraph("<b>Estado</b>", estilos["cell_label"]),
+        Paragraph(
+            "" if modo_pdf == "manual" else estado_legible_pdf(solicitud.get("estado")),
+            estilos["cell_text"]
+        ),
+        Paragraph("<b>Etapa</b>", estilos["cell_label"]),
+        Paragraph(
+            "" if modo_pdf == "manual" else etapa_legible_pdf(solicitud.get("etapa_actual")),
+            estilos["cell_text"]
+        ),
+    ],
+]
+
+
+    tabla_acceso = Table(
+    datos_acceso,
+    colWidths=[2.3 * cm, 6.4 * cm, 2.3 * cm, 6.4 * cm],
+    rowHeights=[0.50 * cm, 0.50 * cm, 0.50 * cm]
+)
+
+    tabla_acceso.setStyle(TableStyle([
+    ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#111827")),
+    ("INNERGRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#374151")),
+    ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f8fafc")),
+    ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#f8fafc")),
+    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ("TOPPADDING", (0, 0), (-1, -1), 4),
+    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+]))
+
+    elementos.append(tabla_acceso)
+    elementos.append(Spacer(1, 0.18 * cm))
+
+    # =====================================================
+    # 3. PÁGINAS WEB SOLICITADAS
+    # =====================================================
+
+    agregar_titulo_seccion(
+        elementos,
+        "3. PÁGINAS WEB SOLICITADAS",
+        estilos
+    )
+
+    estilo_web_header = ParagraphStyle(
+        "estilo_web_header",
+        fontName="Helvetica-Bold",
+        fontSize=7.5,
+        leading=9,
+        textColor=colors.HexColor("#0f172a"),
+        alignment=1
+    )
+
+    estilo_web_numero = ParagraphStyle(
+        "estilo_web_numero",
+        fontName="Helvetica-Bold",
+        fontSize=7.5,
+        leading=9,
+        textColor=colors.HexColor("#1d4ed8"),
+        alignment=1
+    )
+
+    estilo_web_cell = ParagraphStyle(
+        "estilo_web_cell",
+        fontName="Helvetica",
+        fontSize=7.5,
+        leading=9,
+        textColor=colors.HexColor("#334155"),
+        wordWrap="CJK"
+    )
+
+    data_paginas = [
+        [
+            Paragraph("N°", estilo_web_header),
+            Paragraph("URL / Página web", estilo_web_header),
+            Paragraph("Descripción", estilo_web_header)
+        ]
+    ]
+
+    if paginas_web:
+        for pagina in paginas_web:
+            descripcion = pagina.get("descripcion")
+
+            data_paginas.append([
+                Paragraph(str(pagina.get("numero") or ""), estilo_web_numero),
+                Paragraph(str(pagina.get("url_pagina") or ""), estilo_web_cell),
+                Paragraph(str(descripcion or ""), estilo_web_cell)
+            ])
+    else:
+        data_paginas.append([
+            Paragraph("-", estilo_web_numero),
+            Paragraph("No registra páginas web solicitadas.", estilo_web_cell),
+            Paragraph("-", estilo_web_cell)
+        ])
+
+    # IMPORTANTE:
+    # No usar documento.width aquí porque en tu PDF queda más ancho
+    # que las demás tablas. Este ancho mantiene la tabla alineada.
+    ancho_tabla_paginas = 500
+
+    tabla_paginas = Table(
+        data_paginas,
+        colWidths=[
+            38,
+            285,
+            170
+        ],
+        repeatRows=1,
+        hAlign="CENTER"
+    )
+
+    tabla_paginas.setStyle(TableStyle([
+        # Encabezado
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#eaf1ff")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.HexColor("#0f172a")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("ALIGN", (0, 0), (-1, 0), "CENTER"),
+        ("VALIGN", (0, 0), (-1, 0), "MIDDLE"),
+
+        # Cuerpo
+        ("BACKGROUND", (0, 1), (-1, -1), colors.HexColor("#ffffff")),
+        ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#f8fafc")),
+        ("VALIGN", (0, 1), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 1), (0, -1), "CENTER"),
+
+        # Bordes
+        ("GRID", (0, 0), (-1, -1), 0.45, colors.HexColor("#64748b")),
+        ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#475569")),
+
+        # Espaciado
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+    ]))
+
+    elementos.append(tabla_paginas)
+    elementos.append(Spacer(1, 8))
+
+    # =====================================================
+    # 4. justificación
+    # =====================================================
+
+    agregar_titulo_seccion(elementos, "4. JUSTIFICACIÓN DE LA NECESIDAD INSTITUCIONAL", estilos)
+
+    justificacion = texto_seguro(solicitud["justificacion_necesidad_institucional"])
+
+    if len(justificacion) > 300:
+        justificacion = justificacion[:300] + "..."
+
+    tabla_justificacion = Table(
+        [[Paragraph(justificacion, estilos["cell_text"])]],
+        colWidths=[17.4 * cm],
+        rowHeights=[1.25 * cm]
+    )
+
+    tabla_justificacion.setStyle(TableStyle([
+        ("BOX", (0, 0), (-1, -1), 0.8, colors.HexColor("#111827")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+        ("LEFTPADDING", (0, 0), (-1, -1), 7),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 7),
+    ]))
+
+    elementos.append(tabla_justificacion)
+    elementos.append(Spacer(1, 0.22 * cm))
+
+    # =====================================================
+    # 5. firmas generales
+    # =====================================================
+
+    agregar_espacios_firmas(elementos, estilos, solicitud, modo_pdf)
+
+  # =====================================================
+    # 6. sección exclusiva TICS
+    # =====================================================
+
+    if incluir_seccion_tics:
+        agregar_seccion_tics_vertical_compacta(elementos, estilos)
+
+    documento.build(elementos)
+
+    buffer.seek(0)
+    return buffer
+
+
+@app.route("/api/admin/solicitudes/<int:solicitud_id>/pdf", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics")
+def descargar_pdf_solicitud(solicitud_id):
+    solicitud, paginas_web, error = obtener_solicitud_completa_para_pdf(solicitud_id)
+
+    if error:
+        return jsonify({
+            "estado": "error",
+            "mensaje": error
+        }), 404
+
+    try:
+        rol_actual = request.usuario_actual["rol"]
+        incluir_seccion_tics = rol_actual == "analista_tics"
+
+        pdf_buffer = generar_pdf_solicitud_a4(
+            solicitud,
+            paginas_web,
+            incluir_seccion_tics=incluir_seccion_tics
+        )
+
+        nombre_archivo = f"{solicitud['codigo_solicitud']}.pdf"
+
+        respuesta = send_file(
+            pdf_buffer,
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=nombre_archivo,
+            max_age=0
+        )
+
+        respuesta.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        respuesta.headers["Pragma"] = "no-cache"
+        respuesta.headers["Expires"] = "0"
+
+        return respuesta
+
+    except Exception as error:
+        print("ERROR AL GENERAR PDF:", str(error))
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al generar el PDF.",
+            "error": str(error)
+        }), 500
+
+# =====================================================
+# flujo electrónico público con FirmaEC
+# =====================================================
+
+def validar_archivo_pdf(archivo):
+    """
+    Valida que el archivo recibido sea realmente un PDF.
+    Revisa extensión y cabecera interna %PDF-.
+    """
+
+    if archivo is None:
+        return False, "debe seleccionar un archivo PDF."
+
+    if archivo.filename is None or archivo.filename.strip() == "":
+        return False, "el archivo PDF es obligatorio."
+
+    nombre_original = secure_filename(archivo.filename)
+
+    if not nombre_original.lower().endswith(".pdf"):
+        return False, "solo se permite subir archivos PDF."
+
+    try:
+        inicio_archivo = archivo.stream.read(5)
+        archivo.stream.seek(0)
+
+        if inicio_archivo != b"%PDF-":
+            return False, "el archivo seleccionado no parece ser un PDF válido."
+
+    except Exception:
+        return False, "no se pudo validar el archivo PDF."
+
+    return True, None
+
+
+def registrar_documento_firmaec_si_existe(solicitud_id, codigo_solicitud, nombre_archivo):
+    """
+    Registra el PDF firmado en solicitud_documentos si la tabla existe.
+    Si la tabla no existe o tiene otra estructura, no rompe el flujo.
+    """
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return False
+
+    try:
+        cursor = conexion.cursor()
+
+        cursor.execute("""
+            insert into solicitud_documentos (
+                solicitud_id,
+                etapa,
+                rol_firmante,
+                usuario_id,
+                tipo_documento,
+                nombre_archivo,
+                ruta_archivo,
+                mime_type,
+                firmado,
+                firma_validada,
+                observacion
+            ) values (
+                %s,
+                'firma_solicitante',
+                'solicitante',
+                null,
+                'pdf_firmado_electronico',
+                %s,
+                %s,
+                'application/pdf',
+                1,
+                0,
+                %s
+            );
+        """, (
+            solicitud_id,
+            nombre_archivo,
+            os.path.join(FIRMADOS_FOLDER, nombre_archivo),
+            f"PDF firmado electrónicamente por el solicitante para {codigo_solicitud}."
+        ))
+
+        conexion.commit()
+        cursor.close()
+        conexion.close()
+
+        return True
+
+    except Exception as error:
+        print("advertencia: no se pudo registrar en solicitud_documentos:", error)
+
+        try:
+            cursor.close()
+            conexion.close()
+        except Exception:
+            pass
+
+        return False
+
+
+@app.route("/api/public/electronico/preparar", methods=["POST", "OPTIONS"])
+def preparar_solicitud_electronica_firmaec():
+    """
+    Crea la solicitud electrónica en estado inicial,
+    guarda las páginas solicitadas y permite descargar el PDF institucional lleno.
+    """
+
+    if request.method == "OPTIONS":
+        return jsonify({"estado": "ok"}), 200
+
+    data = request.get_json(silent=True) or {}
+
+    if not data:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se recibieron datos para preparar la solicitud electrónica."
+        }), 400
+
+    errores, datos = validar_solicitud_publica(data)
+
+    if errores:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "existen errores de validación en el formulario.",
+            "errores": errores
+        }), 400
+
+    direccion_id = data.get("direccion_id")
+    area_id = data.get("area_id")
+    cargo_id = data.get("cargo_id")
+
+    try:
+        direccion_id = int(direccion_id)
+        area_id = int(area_id)
+        cargo_id = int(cargo_id)
+    except Exception:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "debe seleccionar dirección, área y cargo válidos."
+        }), 400
+
+    codigo_solicitud = generar_codigo_solicitud()
+
+    if codigo_solicitud is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo generar el código de solicitud."
+        }), 500
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        # =====================================================
+        # validar dirección, área y cargo
+        # =====================================================
+
+        cursor.execute("""
+            select id, nombre
+            from direcciones
+            where id = %s
+              and estado = 'activo'
+            limit 1;
+        """, (direccion_id,))
+
+        direccion = cursor.fetchone()
+
+        if direccion is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "la dirección seleccionada no existe o está inactiva."
+            }), 400
+
+        cursor.execute("""
+            select id, direccion_id, nombre
+            from areas
+            where id = %s
+              and direccion_id = %s
+              and estado = 'activo'
+            limit 1;
+        """, (area_id, direccion_id))
+
+        area = cursor.fetchone()
+
+        if area is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "el área seleccionada no pertenece a la dirección indicada o está inactiva."
+            }), 400
+
+        cursor.execute("""
+            select id, area_id, nombre
+            from cargos
+            where id = %s
+              and area_id = %s
+              and estado = 'activo'
+            limit 1;
+        """, (cargo_id, area_id))
+
+        cargo = cursor.fetchone()
+
+        if cargo is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "el cargo seleccionado no pertenece al área indicada o está inactivo."
+            }), 400
+
+        # =====================================================
+        # obtener jefe asignado del área
+        # =====================================================
+
+        cursor.execute("""
+            select
+                id,
+                usuario_id,
+                nombres,
+                apellidos,
+                correo,
+                cargo
+            from area_personal
+            where area_id = %s
+              and tipo_responsable = 'jefe_area'
+              and estado = 'activo'
+            order by id asc
+            limit 1;
+        """, (area_id,))
+
+        jefe_area = cursor.fetchone()
+
+        if jefe_area is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no existe un jefe configurado para el área seleccionada."
+            }), 400
+
+        jefe_asignado_id = jefe_area.get("usuario_id")
+
+        # =====================================================
+        # insertar solicitud electrónica
+        # =====================================================
+
+        cursor.execute("""
+            insert into solicitudes (
+                direccion_id,
+                area_id,
+                cargo_id,
+                jefe_asignado_id,
+                codigo_solicitud,
+                nombres_completos,
+                cedula,
+                correo_institucional,
+                telefono_ext,
+                dependencia,
+                area_unidad,
+                cargo,
+                fecha_solicitud,
+                tipo_usuario,
+                nombre_usuario_externo,
+                direccion_ip,
+                tiempo_vigencia_acceso,
+                justificacion_necesidad_institucional,
+                estado,
+                etapa_actual,
+                bloqueada
+            ) values (
+                %s, %s, %s, %s,
+                %s, %s, %s, %s, %s,
+                %s, %s, %s,
+                %s, %s, %s, %s,
+                %s, %s,
+                'pendiente_firma_solicitante',
+                'firma_solicitante',
+                false
+            );
+        """, (
+            direccion_id,
+            area_id,
+            cargo_id,
+            jefe_asignado_id,
+            codigo_solicitud,
+            datos["nombres_completos"],
+            datos["cedula"],
+            datos["correo_institucional"],
+            datos["telefono_ext"],
+            direccion["nombre"],
+            area["nombre"],
+            cargo["nombre"],
+            convertir_fecha(datos["fecha_solicitud"]),
+            datos["tipo_usuario"],
+            datos["nombre_usuario_externo"],
+            datos["direccion_ip"],
+            datos["tiempo_vigencia_acceso"],
+            datos["justificacion_necesidad_institucional"]
+        ))
+
+        solicitud_id = cursor.lastrowid
+
+        # =====================================================
+        # insertar páginas web
+        # =====================================================
+
+        for index, pagina in enumerate(datos["paginas_web"], start=1):
+            cursor.execute("""
+                insert into solicitud_paginas_web (
+                    solicitud_id,
+                    numero,
+                    url_pagina,
+                    descripcion
+                ) values (
+                    %s, %s, %s, %s
+                );
+            """, (
+                solicitud_id,
+                index,
+                pagina["url_pagina"],
+                pagina["descripcion"]
+            ))
+
+        conexion.commit()
+
+        cursor.close()
+        conexion.close()
+
+        try:
+            registrar_auditoria(
+                usuario_id=None,
+                solicitud_id=solicitud_id,
+                modulo="firmaec_publico",
+                accion="preparar_solicitud_firmaec",
+                descripcion=f"Solicitud electrónica preparada para FirmaEC con código {codigo_solicitud}.",
+                datos_anteriores=None,
+                datos_nuevos={
+                    "codigo_solicitud": codigo_solicitud,
+                    "direccion_id": direccion_id,
+                    "area_id": area_id,
+                    "cargo_id": cargo_id,
+                    "jefe_asignado_id": jefe_asignado_id,
+                    "estado": "pendiente_firma_solicitante",
+                    "etapa_actual": "firma_solicitante"
+                }
+            )
+        except Exception as error_auditoria:
+            print("advertencia: no se pudo registrar auditoría firmaec:", error_auditoria)
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "formato electrónico generado correctamente.",
+            "codigo_solicitud": codigo_solicitud,
+            "url_descarga": f"/api/public/electronico/{codigo_solicitud}/pdf",
+            "solicitud": {
+                "id": solicitud_id,
+                "codigo_solicitud": codigo_solicitud,
+                "estado": "pendiente_firma_solicitante",
+                "etapa_actual": "firma_solicitante",
+                "nombres_completos": datos["nombres_completos"],
+                "correo_institucional": datos["correo_institucional"],
+                "dependencia": direccion["nombre"],
+                "area_unidad": area["nombre"],
+                "cargo": cargo["nombre"]
+            },
+            "jefe_area": {
+                "id": jefe_area.get("id"),
+                "usuario_id": jefe_area.get("usuario_id"),
+                "nombres": jefe_area.get("nombres"),
+                "apellidos": jefe_area.get("apellidos"),
+                "correo": jefe_area.get("correo"),
+                "cargo": jefe_area.get("cargo")
+            }
+        }), 201
+
+    except Error as error:
+        try:
+            conexion.rollback()
+            conexion.close()
+        except Exception:
+            pass
+
+        print("ERROR MYSQL AL PREPARAR SOLICITUD ELECTRÓNICA:", error)
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al preparar la solicitud electrónica.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        try:
+            conexion.rollback()
+            conexion.close()
+        except Exception:
+            pass
+
+        print("ERROR GENERAL AL PREPARAR SOLICITUD ELECTRÓNICA:", error)
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al preparar la solicitud electrónica.",
+            "error": str(error)
+        }), 500
+
+
+@app.route("/api/public/electronico/<codigo_solicitud>/subir-firmado", methods=["POST", "OPTIONS"])
+def subir_pdf_firmado_firmaec(codigo_solicitud):
+    """
+    Recibe el PDF firmado electrónicamente por el solicitante.
+    Al subirlo correctamente, la solicitud pasa a jefe inmediato.
+    """
+
+    if request.method == "OPTIONS":
+        return jsonify({"estado": "ok"}), 200
+
+    codigo_solicitud = limpiar_texto(codigo_solicitud).upper()
+
+    if not codigo_solicitud:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el código de solicitud es obligatorio."
+        }), 400
+
+    if not re.match(r"^INAMHI-WEB-\d{4}-\d{4}$", codigo_solicitud):
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el código de solicitud no tiene un formato válido."
+        }), 400
+
+    if "archivo" not in request.files:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "debe seleccionar el PDF firmado electrónicamente."
+        }), 400
+
+    archivo = request.files["archivo"]
+
+    archivo_valido, mensaje_archivo = validar_archivo_pdf(archivo)
+
+    if not archivo_valido:
+        return jsonify({
+            "estado": "error",
+            "mensaje": mensaje_archivo
+        }), 400
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                id,
+                codigo_solicitud,
+                nombres_completos,
+                correo_institucional,
+                estado,
+                etapa_actual
+            from solicitudes
+            where codigo_solicitud = %s
+            limit 1;
+        """, (codigo_solicitud,))
+
+        solicitud = cursor.fetchone()
+
+        if solicitud is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no se encontró una solicitud con ese código."
+            }), 404
+
+        if solicitud["estado"] != "pendiente_firma_solicitante":
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "la solicitud ya no está pendiente de firma del solicitante.",
+                "estado_actual": solicitud["estado"],
+                "etapa_actual": solicitud["etapa_actual"]
+            }), 400
+
+        nombre_archivo = f"pdf_firmado_solicitante_{codigo_solicitud}.pdf"
+        ruta_archivo = os.path.join(FIRMADOS_FOLDER, nombre_archivo)
+
+        archivo.save(ruta_archivo)
+
+        cursor.execute("""
+            update solicitudes
+            set
+                estado = 'pendiente_jefe_inmediato',
+                etapa_actual = 'jefe_inmediato',
+                bloqueada = false
+            where codigo_solicitud = %s;
+        """, (codigo_solicitud,))
+
+        conexion.commit()
+
+        cursor.close()
+        conexion.close()
+
+        registrar_documento_firmaec_si_existe(
+            solicitud_id=solicitud["id"],
+            codigo_solicitud=codigo_solicitud,
+            nombre_archivo=nombre_archivo
+        )
+
+        try:
+            registrar_auditoria(
+                usuario_id=None,
+                solicitud_id=solicitud["id"],
+                modulo="firmaec_publico",
+                accion="subir_pdf_firmado_solicitante",
+                descripcion=(
+                    f"El solicitante subió el PDF firmado electrónicamente. "
+                    f"La solicitud {codigo_solicitud} fue enviada al jefe inmediato."
+                ),
+                datos_anteriores={
+                    "estado": solicitud["estado"],
+                    "etapa_actual": solicitud["etapa_actual"]
+                },
+                datos_nuevos={
+                    "estado": "pendiente_jefe_inmediato",
+                    "etapa_actual": "jefe_inmediato",
+                    "archivo": nombre_archivo
+                }
+            )
+        except Exception as error_auditoria:
+            print("advertencia: no se pudo registrar auditoría de PDF firmado:", error_auditoria)
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "PDF firmado subido correctamente. La solicitud fue enviada al jefe inmediato.",
+            "solicitud": {
+                "id": solicitud["id"],
+                "codigo_solicitud": codigo_solicitud,
+                "estado": "pendiente_jefe_inmediato",
+                "etapa_actual": "jefe_inmediato",
+                "archivo_firmado": nombre_archivo
+            }
+        }), 200
+
+    except Error as error:
+        conexion.rollback()
+
+        print("error al subir pdf firmado:", error)
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al subir el PDF firmado.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        conexion.rollback()
+
+        print("error inesperado al subir pdf firmado:", error)
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al subir el PDF firmado.",
+            "error": str(error)
+        }), 500
+# =====================================================
+# flujo manual público
+# =====================================================
+
+def generar_uuid_manual():
+    return f"MAN-{uuid.uuid4().hex[:8].upper()}"
+
+
+def generar_pdf_manual_vacio(uuid_solicitud, nombres, apellidos, correo):
+    """
+    Genera el PDF manual usando el MISMO FORMATO institucional
+    que ya utiliza el sistema en generar_pdf_solicitud_a4().
+    No crea un formato nuevo.
+    """
+
+    fecha_actual = datetime.datetime.now().date()
+
+    solicitud_manual = {
+        "id": None,
+        "codigo_solicitud": uuid_solicitud,
+
+        "nombres_completos": f"{nombres} {apellidos}",
+        "correo_institucional": correo,
+
+        "cedula": "",
+        "telefono_ext": "",
+        "dependencia": "",
+        "area_unidad": "",
+        "cargo": "",
+        "fecha_solicitud": fecha_actual,
+
+        "tipo_usuario": "",
+        "nombre_usuario_externo": "",
+        "direccion_ip": "",
+        "tiempo_vigencia_acceso": "",
+
+        "justificacion_necesidad_institucional": (
+            " "
+            " "
+            " "
+            ""
+        ),
+
+        "estado": "pendiente_subida_manual",
+        "etapa_actual": "proceso_manual",
+
+        "bloqueada": False,
+        "created_at": datetime.datetime.now(),
+        "updated_at": datetime.datetime.now()
+    }
+
+    paginas_manual = [
+        {
+            "numero": 1,
+            "url_pagina": "",
+            "descripcion": ""
+        },
+        {
+            "numero": 2,
+            "url_pagina": "",
+            "descripcion": ""
+        },
+        {
+            "numero": 3,
+            "url_pagina": "",
+            "descripcion": ""
+        },
+        {
+            "numero": 4,
+            "url_pagina": "",
+            "descripcion": ""
+        }
+    ]
+    solicitud_manual["modo_pdf"] = "manual"
+
+    return generar_pdf_solicitud_a4(
+        solicitud_manual,
+        paginas_manual,
+        incluir_seccion_tics=False
+        
+    )
+
+
+@app.route("/api/manual/registrar", methods=["POST", "OPTIONS"])
+def registrar_solicitud_manual():
+    if request.method == "OPTIONS":
+        return jsonify({"estado": "ok"}), 200
+
+    data = request.get_json()
+
+    if not data:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se recibieron datos para registrar la solicitud manual."
+        }), 400
+
+    nombres = normalizar_espacios(data.get("nombres"))
+    apellidos = normalizar_espacios(data.get("apellidos"))
+    correo = limpiar_texto(data.get("correo")).lower()
+
+    errores = {}
+
+    if not nombres:
+        errores["nombres"] = "el nombre es obligatorio."
+    elif len(nombres) < 2:
+        errores["nombres"] = "el nombre debe tener mínimo 2 caracteres."
+    elif not validar_solo_letras_espacios(nombres):
+        errores["nombres"] = "el nombre solo puede contener letras y espacios."
+
+    if not apellidos:
+        errores["apellidos"] = "el apellido es obligatorio."
+    elif len(apellidos) < 2:
+        errores["apellidos"] = "el apellido debe tener mínimo 2 caracteres."
+    elif not validar_solo_letras_espacios(apellidos):
+        errores["apellidos"] = "el apellido solo puede contener letras y espacios."
+
+    if not correo:
+        errores["correo"] = "el correo electrónico es obligatorio."
+    elif not validar_correo_general(correo):
+        errores["correo"] = "ingrese un correo electrónico válido."
+
+    if errores:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "existen errores de validación en el formulario manual.",
+            "errores": errores
+        }), 400
+
+    uuid_solicitud = generar_uuid_manual()
+    fecha_hora = datetime.datetime.now()
+    fecha_registro = fecha_hora.date()
+    hora_registro = fecha_hora.time().replace(microsecond=0)
+
+    nombre_pdf = f"documento_manual_vacio_{uuid_solicitud}.pdf"
+    ruta_pdf = os.path.join(DOCUMENTOS_FOLDER, nombre_pdf)
+
+    try:
+        pdf_buffer = generar_pdf_manual_vacio(
+            uuid_solicitud=uuid_solicitud,
+            nombres=nombres,
+            apellidos=apellidos,
+            correo=correo
+        )
+
+        with open(ruta_pdf, "wb") as archivo_pdf:
+            archivo_pdf.write(pdf_buffer.getvalue())
+
+    except Exception as error:
+        print("error al generar pdf manual:", error)
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo generar el documento PDF manual.",
+            "error": str(error)
+        }), 500
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor()
+
+        cursor.execute("""
+            insert into solicitudes_manual (
+                uuid_solicitud,
+                nombres,
+                apellidos,
+                correo,
+                estado,
+                documento_vacio,
+                documento_escaneado,
+                fecha_registro,
+                hora_registro
+            ) values (
+                %s, %s, %s, %s,
+                'PENDIENTE_SUBIDA',
+                %s,
+                null,
+                %s,
+                %s
+            );
+        """, (
+            uuid_solicitud,
+            nombres,
+            apellidos,
+            correo,
+            nombre_pdf,
+            fecha_registro,
+            hora_registro
+        ))
+
+        conexion.commit()
+        solicitud_manual_id = cursor.lastrowid
+
+        cursor.close()
+        conexion.close()
+
+        try:
+            registrar_auditoria(
+                usuario_id=None,
+                solicitud_id=None,
+                modulo="flujo_manual",
+                accion="registrar_descarga_manual",
+                descripcion=(
+                    f"Solicitud manual descargada por: {nombres} {apellidos} "
+                    f"con correo {correo} el {fecha_registro} a las {hora_registro}."
+                ),
+                datos_anteriores=None,
+                datos_nuevos={
+                    "solicitud_manual_id": solicitud_manual_id,
+                    "uuid_solicitud": uuid_solicitud,
+                    "nombres": nombres,
+                    "apellidos": apellidos,
+                    "correo": correo,
+                    "estado": "PENDIENTE_SUBIDA",
+                    "documento_vacio": nombre_pdf
+                }
+            )
+        except Exception as error_auditoria:
+            print("advertencia: no se pudo registrar auditoría manual:", error_auditoria)
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "solicitud manual registrada correctamente.",
+            "uuid_solicitud": uuid_solicitud,
+            "fecha": str(fecha_registro),
+            "hora": str(hora_registro),
+            "url_descarga": f"/api/manual/{uuid_solicitud}/descargar",
+            "solicitud": {
+                "id": solicitud_manual_id,
+                "uuid_solicitud": uuid_solicitud,
+                "nombres": nombres,
+                "apellidos": apellidos,
+                "correo": correo,
+                "estado": "PENDIENTE_SUBIDA"
+            }
+        }), 201
+
+    except Error as error:
+        conexion.rollback()
+
+        print("error al registrar solicitud manual:", error)
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al registrar la solicitud manual.",
+            "error": str(error)
+        }), 500
+
+# =====================================================
+# validar solicitud manual por ID
+# =====================================================
+
+@app.route("/api/manual/validar/<uuid_solicitud>", methods=["GET"])
+def validar_solicitud_manual(uuid_solicitud):
+    uuid_solicitud = limpiar_texto(uuid_solicitud).upper()
+
+    if not uuid_solicitud:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el ID de solicitud manual es obligatorio."
+        }), 400
+
+    if not re.match(r"^MAN-[A-Z0-9]{8}$", uuid_solicitud):
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el ID manual no tiene un formato válido. ejemplo: MAN-65CA1D9A."
+        }), 400
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                id,
+                uuid_solicitud,
+                nombres,
+                apellidos,
+                correo,
+                estado,
+                documento_vacio,
+                documento_escaneado,
+                fecha_registro,
+                hora_registro,
+                created_at,
+                updated_at
+            from solicitudes_manual
+            where uuid_solicitud = %s
+            limit 1;
+        """, (uuid_solicitud,))
+
+        solicitud = cursor.fetchone()
+
+        cursor.close()
+        conexion.close()
+
+        if solicitud is None:
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no se encontró una solicitud manual con ese ID."
+            }), 404
+
+        habilitar_subida = solicitud["estado"] != "FINALIZADO"
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "solicitud manual encontrada correctamente.",
+            "habilitar_subida": habilitar_subida,
+            "solicitud": {
+                "id": solicitud["id"],
+                "uuid_solicitud": solicitud["uuid_solicitud"],
+                "nombres": solicitud["nombres"],
+                "apellidos": solicitud["apellidos"],
+                "correo": solicitud["correo"],
+                "estado": solicitud["estado"],
+                "documento_vacio": solicitud["documento_vacio"],
+                "documento_escaneado": solicitud["documento_escaneado"],
+                "fecha_registro": str(solicitud["fecha_registro"]) if solicitud["fecha_registro"] else None,
+                "hora_registro": str(solicitud["hora_registro"]) if solicitud["hora_registro"] else None,
+                "created_at": serializar_fecha(solicitud["created_at"]),
+                "updated_at": serializar_fecha(solicitud["updated_at"])
+            }
+        }), 200
+
+    except Error as error:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al validar la solicitud manual.",
+            "error": str(error)
+        }), 500
+
+
+# =====================================================
+# correo de activación para proceso manual
+# =====================================================
+
+def enviar_correo_activacion_manual(nombres, apellidos, correo, uuid_solicitud):
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
+        print("configuración SMTP incompleta. No se envió el correo de activación manual.")
+        return False
+
+    correo_destino = limpiar_texto(correo).lower()
+    if not correo_destino:
+        print("no existe correo destinatario para activación manual.")
+        return False
+
+    nombre_completo = f"{nombres} {apellidos}".strip()
+    fecha_actual = datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
+    anio_actual = datetime.datetime.now().year
+    nombre_seguro = html.escape(nombre_completo)
+    uuid_seguro = html.escape(uuid_solicitud)
+    fecha_segura = html.escape(fecha_actual)
+    logo_tag = _logo_email_tag()
+
+    asunto = f"Documento recibido - {uuid_solicitud} | INAMHI"
+
+    cuerpo_texto = (
+        f"Estimado/a {nombre_completo},\n\n"
+        f"Su documento fue recibido correctamente.\n\n"
+        f"ID de proceso: {uuid_solicitud}\n"
+        f"Fecha: {fecha_actual}\n\n"
+        f"TICS procesará su solicitud.\n\n"
+        f"INAMHI - mensaje automático, no responda."
+    )
+
+    cuerpo_html = f"""<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:'Segoe UI',Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:32px 0;">
+  <tr><td align="center">
+    <table width="560" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 4px 18px rgba(0,0,0,0.08);">
+
+      <!-- CABECERA -->
+      <tr>
+        <td style="background:#0c4a6e;padding:28px 32px;text-align:center;">
+          {logo_tag}
+          <p style="color:#fff;margin:0;font-size:18px;font-weight:700;">Documento recibido</p>
+          <p style="color:#bae6fd;margin:6px 0 0;font-size:13px;">Solicitud de Liberación Web &mdash; Proceso manual</p>
+        </td>
+      </tr>
+
+      <!-- CUERPO -->
+      <tr>
+        <td style="padding:28px 32px;">
+          <p style="margin:0 0 20px;font-size:15px;color:#1e293b;">
+            Estimado/a <strong>{nombre_seguro}</strong>, su documento fue recibido correctamente.
+          </p>
+          <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #e2e8f0;border-radius:10px;overflow:hidden;">
+            <tr style="background:#f8fafc;">
+              <td style="padding:11px 16px;font-size:13px;color:#64748b;font-weight:600;border-bottom:1px solid #e2e8f0;width:40%;">ID de proceso</td>
+              <td style="padding:11px 16px;font-size:13px;color:#0f172a;font-weight:700;border-bottom:1px solid #e2e8f0;font-family:monospace;">{uuid_seguro}</td>
+            </tr>
+            <tr>
+              <td style="padding:11px 16px;font-size:13px;color:#64748b;font-weight:600;">Fecha de recepción</td>
+              <td style="padding:11px 16px;font-size:13px;color:#0f172a;">{fecha_segura}</td>
+            </tr>
+          </table>
+          <p style="margin:20px 0 0;font-size:13px;color:#64748b;line-height:1.6;">
+            Si tiene dudas, comuníquese con el área de TICS.
+          </p>
+        </td>
+      </tr>
+
+      <!-- FOOTER -->
+      <tr>
+        <td style="background:#f8fafc;padding:14px 32px;border-top:1px solid #e2e8f0;text-align:center;">
+          <p style="margin:0;font-size:11px;color:#94a3b8;">
+            &copy; {anio_actual} Instituto Nacional de Meteorología e Hidrología &mdash; Ecuador<br>
+            Mensaje automático, por favor no responda.
+          </p>
+        </td>
+      </tr>
+
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>"""
+
+    try:
+        enviar_correo(
+            destinatario=correo_destino,
+            asunto=asunto,
+            cuerpo=cuerpo_texto,
+            cuerpo_html=cuerpo_html
+        )
+        print(f"correo de activación manual enviado a {correo_destino}")
+        return True
+    except Exception as error:
+        print("error al enviar correo de activación manual:", error)
+        return False
+
+
+# =====================================================
+# subir documento manual firmado y finalizar proceso
+# =====================================================
+
+@app.route("/api/manual/<uuid_solicitud>/subir", methods=["POST", "OPTIONS"])
+def subir_documento_manual_firmado(uuid_solicitud):
+    if request.method == "OPTIONS":
+        return jsonify({"estado": "ok"}), 200
+
+    uuid_solicitud = limpiar_texto(uuid_solicitud).upper()
+
+    if not uuid_solicitud:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el ID de solicitud manual es obligatorio."
+        }), 400
+
+    if not re.match(r"^MAN-[A-Z0-9]{8}$", uuid_solicitud):
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el ID manual no tiene un formato válido. ejemplo: MAN-65CA1D9A."
+        }), 400
+
+    if "archivo" not in request.files:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "debe seleccionar un documento PDF."
+        }), 400
+
+    archivo = request.files["archivo"]
+
+    if archivo.filename is None or archivo.filename.strip() == "":
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el archivo PDF es obligatorio."
+        }), 400
+
+    nombre_original = secure_filename(archivo.filename)
+
+    if not nombre_original.lower().endswith(".pdf"):
+        return jsonify({
+            "estado": "error",
+            "mensaje": "solo se permite subir archivos PDF."
+        }), 400
+
+    # Validación básica de firma PDF: el archivo debe iniciar con %PDF-
+    try:
+        inicio_archivo = archivo.stream.read(5)
+        archivo.stream.seek(0)
+
+        if inicio_archivo != b"%PDF-":
+            return jsonify({
+                "estado": "error",
+                "mensaje": "el archivo seleccionado no parece ser un PDF válido."
+            }), 400
+
+    except Exception:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo validar el archivo PDF."
+        }), 400
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                id,
+                uuid_solicitud,
+                nombres,
+                apellidos,
+                correo,
+                estado,
+                documento_escaneado
+            from solicitudes_manual
+            where uuid_solicitud = %s
+            limit 1;
+        """, (uuid_solicitud,))
+
+        solicitud = cursor.fetchone()
+
+        if solicitud is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no se encontró una solicitud manual con ese ID."
+            }), 404
+
+        if solicitud["estado"] == "FINALIZADO":
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "esta solicitud manual ya fue finalizada anteriormente."
+            }), 400
+
+        nombre_archivo_final = f"documento_manual_firmado_{uuid_solicitud}.pdf"
+        ruta_archivo_final = os.path.join(ESCANEADOS_FOLDER, nombre_archivo_final)
+
+        archivo.save(ruta_archivo_final)
+
+        cursor.execute("""
+            update solicitudes_manual
+            set
+                documento_escaneado = %s,
+                estado = 'FINALIZADO'
+            where uuid_solicitud = %s;
+        """, (
+            nombre_archivo_final,
+            uuid_solicitud
+        ))
+
+        conexion.commit()
+
+        cursor.close()
+        conexion.close()
+
+        try:
+            registrar_auditoria(
+                usuario_id=None,
+                solicitud_id=None,
+                modulo="flujo_manual",
+                accion="subir_documento_manual_finalizado",
+                descripcion=(
+                    f"El usuario subió el documento manual firmado para la solicitud {uuid_solicitud}. "
+                    f"El proceso manual quedó FINALIZADO."
+                ),
+                datos_anteriores={
+                    "uuid_solicitud": uuid_solicitud,
+                    "estado": solicitud["estado"],
+                    "documento_escaneado": solicitud["documento_escaneado"]
+                },
+                datos_nuevos={
+                    "uuid_solicitud": uuid_solicitud,
+                    "estado": "FINALIZADO",
+                    "documento_escaneado": nombre_archivo_final
+                }
+            )
+        except Exception as error_auditoria:
+            print("advertencia: no se pudo registrar auditoría de subida manual:", error_auditoria)
+
+        # enviar correo de activación automático al correo registrado en el formulario manual
+        correo_enviado = False
+        try:
+            correo_enviado = enviar_correo_activacion_manual(
+                nombres=solicitud["nombres"],
+                apellidos=solicitud["apellidos"],
+                correo=solicitud["correo"],
+                uuid_solicitud=uuid_solicitud
+            )
+        except Exception as error_correo:
+            print("advertencia: no se pudo enviar correo de activación manual:", error_correo)
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "documento manual subido correctamente. el proceso manual quedó finalizado.",
+            "correo_enviado": correo_enviado,
+            "solicitud": {
+                "uuid_solicitud": uuid_solicitud,
+                "estado": "FINALIZADO",
+                "documento_escaneado": nombre_archivo_final
+            }
+        }), 200
+
+    except Error as error:
+        conexion.rollback()
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al subir el documento manual.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        conexion.rollback()
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al guardar el documento manual.",
+            "error": str(error)
+        }), 500
+
+
+
+
+@app.route("/api/manual/<uuid_solicitud>/descargar", methods=["GET"])
+def descargar_documento_manual_vacio(uuid_solicitud):
+    uuid_solicitud = limpiar_texto(uuid_solicitud).upper()
+
+    if not uuid_solicitud:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el ID de solicitud es obligatorio."
+        }), 400
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                uuid_solicitud,
+                documento_vacio
+            from solicitudes_manual
+            where uuid_solicitud = %s
+            limit 1;
+        """, (uuid_solicitud,))
+
+        solicitud = cursor.fetchone()
+
+        cursor.close()
+        conexion.close()
+
+        if solicitud is None:
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no se encontró una solicitud manual con ese ID."
+            }), 404
+
+        if not solicitud["documento_vacio"]:
+            return jsonify({
+                "estado": "error",
+                "mensaje": "la solicitud no tiene documento generado."
+            }), 404
+
+        ruta_pdf = os.path.join(DOCUMENTOS_FOLDER, solicitud["documento_vacio"])
+
+        if not os.path.exists(ruta_pdf):
+            return jsonify({
+                "estado": "error",
+                "mensaje": "el archivo PDF no existe en el servidor."
+            }), 404
+
+        return send_file(
+            ruta_pdf,
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=f"documento_manual_{uuid_solicitud}.pdf",
+            max_age=0
+        )
+
+    except Error as error:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al descargar el documento manual.",
+            "error": str(error)
+        }), 500
+
+
+# =====================================================
+# procesos manuales - administrador
+# =====================================================
+
+@app.route("/api/admin/manuales", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador")
+def listar_procesos_manuales_admin():
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                id,
+                uuid_solicitud,
+                nombres,
+                apellidos,
+                correo,
+                estado,
+                documento_vacio,
+                documento_escaneado,
+                fecha_registro,
+                hora_registro,
+                created_at,
+                case
+                    when documento_escaneado is not null
+                         and documento_escaneado <> ''
+                    then true
+                    else false
+                end as tiene_documento_firmado
+            from solicitudes_manual
+            order by id desc;
+        """)
+
+        solicitudes = cursor.fetchall()
+
+        for item in solicitudes:
+            item["tiene_documento_firmado"] = bool(item["tiene_documento_firmado"])
+            item["fecha_registro"] = serializar_fecha(item.get("fecha_registro"))
+            item["created_at"] = serializar_fecha(item.get("created_at"))
+
+            if item.get("hora_registro"):
+                item["hora_registro"] = str(item["hora_registro"])
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "procesos manuales obtenidos correctamente.",
+            "total": len(solicitudes),
+            "solicitudes": solicitudes
+        }), 200
+
+    except Error as error:
+        print("ERROR AL LISTAR PROCESOS MANUALES:", error)
+
+        try:
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al obtener los procesos manuales.",
+            "error": str(error)
+        }), 500
+
+
+@app.route("/api/admin/manuales/<uuid_solicitud>/descargar-firmado", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador")
+def descargar_documento_manual_firmado_admin(uuid_solicitud):
+    uuid_solicitud = limpiar_texto(uuid_solicitud).upper()
+
+    if not uuid_solicitud:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el ID de solicitud manual es obligatorio."
+        }), 400
+
+    if not re.match(r"^MAN-[A-Z0-9]{8}$", uuid_solicitud):
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el ID manual no tiene un formato válido. ejemplo: MAN-65CA1D9A."
+        }), 400
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                id,
+                uuid_solicitud,
+                nombres,
+                apellidos,
+                correo,
+                estado,
+                documento_escaneado
+            from solicitudes_manual
+            where uuid_solicitud = %s
+            limit 1;
+        """, (uuid_solicitud,))
+
+        solicitud = cursor.fetchone()
+
+        cursor.close()
+        conexion.close()
+
+        if solicitud is None:
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no se encontró una solicitud manual con ese ID."
+            }), 404
+
+        if solicitud["estado"] != "FINALIZADO":
+            return jsonify({
+                "estado": "error",
+                "mensaje": "la solicitud manual aún no está finalizada."
+            }), 400
+
+        if not solicitud["documento_escaneado"]:
+            return jsonify({
+                "estado": "error",
+                "mensaje": "la solicitud manual no tiene documento firmado subido."
+            }), 404
+
+        ruta_archivo = os.path.join(ESCANEADOS_FOLDER, solicitud["documento_escaneado"])
+
+        if not os.path.exists(ruta_archivo):
+            return jsonify({
+                "estado": "error",
+                "mensaje": "el archivo firmado no existe en el servidor."
+            }), 404
+
+        try:
+            registrar_auditoria(
+                usuario_id=request.usuario_actual["id"],
+                solicitud_id=None,
+                modulo="flujo_manual",
+                accion="descargar_documento_manual_firmado",
+                descripcion=(
+                    f"El usuario {request.usuario_actual['usuario']} descargó el documento manual firmado "
+                    f"de la solicitud {uuid_solicitud}."
+                ),
+                datos_anteriores=None,
+                datos_nuevos={
+                    "uuid_solicitud": uuid_solicitud,
+                    "documento_escaneado": solicitud["documento_escaneado"]
+                }
+            )
+        except Exception as error_auditoria:
+            print("advertencia: no se pudo registrar auditoría de descarga manual:", error_auditoria)
+
+        return send_file(
+            ruta_archivo,
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=f"documento_manual_firmado_{uuid_solicitud}.pdf",
+            max_age=0
+        )
+
+    except Error as error:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al descargar el documento manual firmado.",
+            "error": str(error)
+        }), 500
+
+
+# =====================================================
+# procesos electrónicos - administrador revisor
+# =====================================================
+
+@app.route("/api/admin/procesos-electronicos", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador")
+def listar_procesos_electronicos_admin():
+    busqueda = limpiar_texto(request.args.get("q"))
+    estado = limpiar_texto(request.args.get("estado"))
+    etapa = limpiar_texto(request.args.get("etapa"))
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        condiciones = []
+        parametros = []
+
+        if busqueda:
+            condiciones.append("""
+                (
+                    s.codigo_solicitud like %s or
+                    s.nombres_completos like %s or
+                    s.cedula like %s or
+                    s.correo_institucional like %s or
+                    s.dependencia like %s or
+                    s.area_unidad like %s or
+                    s.cargo like %s
+                )
+            """)
+
+            valor_busqueda = f"%{busqueda}%"
+
+            parametros.extend([
+                valor_busqueda,
+                valor_busqueda,
+                valor_busqueda,
+                valor_busqueda,
+                valor_busqueda,
+                valor_busqueda,
+                valor_busqueda
+            ])
+
+        if estado:
+            condiciones.append("s.estado = %s")
+            parametros.append(estado)
+
+        if etapa:
+            condiciones.append("s.etapa_actual = %s")
+            parametros.append(etapa)
+
+        where_sql = ""
+
+        if condiciones:
+            where_sql = "where " + " and ".join(condiciones)
+
+        sql = f"""
+            select
+                s.id,
+                s.codigo_solicitud,
+                s.nombres_completos,
+                s.cedula,
+                s.correo_institucional,
+                s.telefono_ext,
+                s.dependencia,
+                s.area_unidad,
+                s.cargo,
+                s.fecha_solicitud,
+                s.tipo_usuario,
+                s.nombre_usuario_externo,
+                s.direccion_ip,
+                s.tiempo_vigencia_acceso,
+                s.justificacion_necesidad_institucional,
+                s.estado,
+                s.etapa_actual,
+                s.bloqueada,
+                s.created_at,
+                s.updated_at,
+
+                (
+                    select count(*)
+                    from solicitud_documentos d
+                    where d.solicitud_id = s.id
+                ) as total_documentos,
+
+                (
+                    select d.nombre_archivo
+                    from solicitud_documentos d
+                    where d.solicitud_id = s.id
+                    order by d.id desc
+                    limit 1
+                ) as ultimo_documento
+
+            from solicitudes s
+            {where_sql}
+            order by s.id desc;
+        """
+
+        cursor.execute(sql, tuple(parametros))
+        solicitudes = cursor.fetchall()
+
+        for item in solicitudes:
+            item["fecha_solicitud"] = str(item["fecha_solicitud"]) if item["fecha_solicitud"] else None
+            item["created_at"] = serializar_fecha(item["created_at"])
+            item["updated_at"] = serializar_fecha(item["updated_at"])
+            item["bloqueada"] = bool(item["bloqueada"]) if item["bloqueada"] is not None else False
+            item["total_documentos"] = int(item["total_documentos"] or 0)
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "procesos electrónicos obtenidos correctamente.",
+            "total": len(solicitudes),
+            "solicitudes": solicitudes
+        }), 200
+
+    except Error as error:
+        print("error al obtener procesos electrónicos:", error)
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al obtener los procesos electrónicos.",
+            "error": str(error)
+        }), 500
+
+
+@app.route("/api/admin/procesos-electronicos/<codigo_solicitud>/pdf-actual", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador")
+def descargar_pdf_actual_proceso_electronico_admin(codigo_solicitud):
+    codigo_solicitud = limpiar_texto(codigo_solicitud).upper()
+
+    if not codigo_solicitud:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el código de solicitud es obligatorio."
+        }), 400
+
+    if not re.match(r"^INAMHI-WEB-\d{4}-\d{4}$", codigo_solicitud):
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el código de solicitud no tiene un formato válido."
+        }), 400
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                id,
+                codigo_solicitud,
+                nombres_completos,
+                cedula,
+                correo_institucional,
+                telefono_ext,
+                dependencia,
+                area_unidad,
+                cargo,
+                fecha_solicitud,
+                tipo_usuario,
+                nombre_usuario_externo,
+                direccion_ip,
+                tiempo_vigencia_acceso,
+                justificacion_necesidad_institucional,
+                estado,
+                etapa_actual,
+                bloqueada,
+                created_at,
+                updated_at
+            from solicitudes
+            where codigo_solicitud = %s
+            limit 1;
+        """, (codigo_solicitud,))
+
+        solicitud = cursor.fetchone()
+
+        if solicitud is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no se encontró una solicitud electrónica con ese código."
+            }), 404
+
+        # Buscar el último PDF subido en solicitud_documentos.
+        cursor.execute("""
+            select
+                id,
+                nombre_archivo,
+                ruta_archivo,
+                tipo_documento,
+                etapa,
+                rol_firmante,
+                created_at
+            from solicitud_documentos
+            where solicitud_id = %s
+              and nombre_archivo is not null
+            order by id desc
+            limit 1;
+        """, (solicitud["id"],))
+
+        documento = cursor.fetchone()
+
+        cursor.close()
+        conexion.close()
+
+        # Si existe un documento subido, se descarga ese.
+        if documento:
+            ruta_archivo = documento.get("ruta_archivo")
+
+            if ruta_archivo and os.path.exists(ruta_archivo):
+                return send_file(
+                    ruta_archivo,
+                    mimetype="application/pdf",
+                    as_attachment=True,
+                    download_name=f"documento_actual_{codigo_solicitud}.pdf",
+                    max_age=0
+                )
+
+            # Si en la BD solo está el nombre, buscamos en carpetas conocidas.
+            nombre_archivo = documento.get("nombre_archivo")
+
+            posibles_rutas = [
+                os.path.join(FIRMADOS_FOLDER, nombre_archivo),
+                os.path.join(DOCUMENTOS_FOLDER, nombre_archivo),
+                os.path.join(ESCANEADOS_FOLDER, nombre_archivo)
+            ]
+
+            for ruta in posibles_rutas:
+                if ruta and os.path.exists(ruta):
+                    return send_file(
+                        ruta,
+                        mimetype="application/pdf",
+                        as_attachment=True,
+                        download_name=f"documento_actual_{codigo_solicitud}.pdf",
+                        max_age=0
+                    )
+
+        # Si no hay PDF firmado/subido, generamos el formato actual desde la solicitud.
+        conexion = get_db_connection()
+
+        if conexion is None:
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no se pudo conectar con la base de datos."
+            }), 500
+
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                numero,
+                url_pagina,
+                descripcion
+            from solicitud_paginas_web
+            where solicitud_id = %s
+            order by numero asc;
+        """, (solicitud["id"],))
+
+        paginas_web = cursor.fetchall()
+
+        cursor.close()
+        conexion.close()
+
+        pdf_buffer = generar_pdf_solicitud_a4(
+            solicitud,
+            paginas_web,
+            incluir_seccion_tics=False
+        )
+
+        return send_file(
+            pdf_buffer,
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=f"formato_{codigo_solicitud}.pdf",
+            max_age=0
+        )
+
+    except Error as error:
+        print("error al descargar pdf actual electrónico:", error)
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al descargar el PDF actual del proceso electrónico.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        print("error inesperado al descargar pdf actual electrónico:", error)
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al descargar el PDF actual del proceso electrónico.",
+            "error": str(error)
+        }), 500
+# =====================================================
+# detalle administrativo de solicitud
+# =====================================================
+
+@app.route("/api/admin/solicitudes/<int:solicitud_id>", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador", "analista_tics", "jefe_inmediato", "maxima_autoridad")
+def obtener_solicitud_admin(solicitud_id):
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        # =====================================================
+        # obtener datos principales de la solicitud
+        # =====================================================
+
+        sql_solicitud = """
+            select
+                id,
+                codigo_solicitud,
+                nombres_completos,
+                cedula,
+                correo_institucional,
+                telefono_ext,
+                dependencia,
+                area_unidad,
+                cargo,
+                fecha_solicitud,
+                tipo_usuario,
+                nombre_usuario_externo,
+                direccion_ip,
+                tiempo_vigencia_acceso,
+                justificacion_necesidad_institucional,
+                estado,
+                etapa_actual,
+                bloqueada,
+                created_at,
+                updated_at
+            from solicitudes
+            where id = %s
+            limit 1;
+        """
+
+        cursor.execute(sql_solicitud, (solicitud_id,))
+        solicitud = cursor.fetchone()
+
+        if solicitud is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "solicitud no encontrada."
+            }), 404
+
+        solicitud["fecha_solicitud"] = serializar_fecha(solicitud["fecha_solicitud"])
+        solicitud["created_at"] = serializar_fecha(solicitud["created_at"])
+        solicitud["updated_at"] = serializar_fecha(solicitud["updated_at"])
+
+        # =====================================================
+        # obtener páginas web solicitadas
+        # =====================================================
+
+        sql_paginas = """
+            select
+                id,
+                numero,
+                url_pagina,
+                descripcion
+            from solicitud_paginas_web
+            where solicitud_id = %s
+            order by numero asc;
+        """
+
+        cursor.execute(sql_paginas, (solicitud_id,))
+        paginas_web = cursor.fetchall()
+
+        # =====================================================
+        # obtener documentos cargados de la solicitud
+        # =====================================================
+
+        sql_documentos = """
+            select
+                id,
+                solicitud_id,
+                etapa,
+                rol_firmante,
+                usuario_id,
+                tipo_documento,
+                nombre_archivo,
+                ruta_archivo,
+                mime_type,
+                firmado,
+                firma_validada,
+                observacion,
+                created_at,
+                updated_at
+            from solicitud_documentos
+            where solicitud_id = %s
+            order by id desc;
+        """
+
+        cursor.execute(sql_documentos, (solicitud_id,))
+        documentos = cursor.fetchall()
+
+        for documento in documentos:
+            documento["created_at"] = serializar_fecha(documento["created_at"])
+            documento["updated_at"] = serializar_fecha(documento["updated_at"])
+
+        # =====================================================
+        # verificar si existe documento firmado cargado
+        # =====================================================
+
+        documento_firmado_cargado = any(
+            documento["firmado"] == 1 or
+            documento["firmado"] is True or
+            documento["firma_validada"] == 1 or
+            documento["firma_validada"] is True or
+            documento["tipo_documento"] in [
+                "pdf_firmado_manual",
+                "pdf_firmado_electronico",
+                "pdf_tics",
+                "pdf_final"
+            ]
+            for documento in documentos
+        )
+
+        documento_actual = documentos[0] if documentos else None
+
+        if documento_actual:
+            solicitud["documento_actual_id"] = documento_actual["id"]
+            solicitud["firma_actual_validada"] = documento_actual["firma_validada"]
+        else:
+            solicitud["documento_actual_id"] = None
+            solicitud["firma_actual_validada"] = False
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "solicitud": solicitud,
+            "paginas_web": paginas_web,
+            "documentos": documentos,
+            "documento_firmado_cargado": documento_firmado_cargado
+        }), 200
+
+    except Error as error:
+        try:
+            cursor.close()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al obtener la solicitud.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        try:
+            cursor.close()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al obtener la solicitud.",
+            "error": str(error)
+        }), 500
+
+
+# =====================================================
+# flujo administrativo de aprobación / rechazo
+# =====================================================
+
+def obtener_siguiente_estado_por_rol(estado_actual, rol_actual):
+    reglas = {
+        ("pendiente_jefe_inmediato", "jefe_inmediato"): {
+            "nuevo_estado": "pendiente_maxima_autoridad",
+            "nueva_etapa": "maxima_autoridad"
+        },
+        ("pendiente_maxima_autoridad", "maxima_autoridad"): {
+            "nuevo_estado": "pendiente_tics",
+            "nueva_etapa": "tics"
+        },
+        ("pendiente_tics", "analista_tics"): {
+            "nuevo_estado": "pendiente_ejecucion_tics",
+            "nueva_etapa": "ejecucion_tics"
+        },
+        ("pendiente_ejecucion_tics", "analista_tics"): {
+            "nuevo_estado": "finalizada",
+            "nueva_etapa": "finalizado"
+        }
+    }
+
+    return reglas.get((estado_actual, rol_actual))
+
+
+def obtener_estado_rechazo_por_rol(estado_actual, rol_actual):
+    rechazos = {
+        "pendiente_jefe_inmediato": {
+            "rol": "jefe_inmediato",
+            "nuevo_estado": "rechazada_jefe_inmediato",
+            "nueva_etapa": "jefe_inmediato"
+        },
+        "pendiente_maxima_autoridad": {
+            "rol": "maxima_autoridad",
+            "nuevo_estado": "rechazada_maxima_autoridad",
+            "nueva_etapa": "maxima_autoridad"
+        },
+        "pendiente_tics": {
+            "rol": "analista_tics",
+            "nuevo_estado": "rechazada_tics",
+            "nueva_etapa": "tics"
+        }
+    }
+
+    regla = rechazos.get(estado_actual)
+
+    if regla is None:
+        return None
+
+    if regla["rol"] != rol_actual:
+        return None
+
+    return regla
+
+def archivo_pdf_valido(archivo):
+    if archivo is None:
+        return False
+
+    nombre_archivo = archivo.filename or ""
+
+    return nombre_archivo.lower().endswith(".pdf")
+
+# =====================================================
+# colocar firma electrónica en PDF
+# =====================================================
+
+def colocar_firma_en_pdf(pdf_entrada, imagen_firma, pdf_salida):
+    """
+    Coloca una imagen de firma en una posición fija del PDF.
+
+    Coordenadas PyMuPDF:
+    - x aumenta hacia la derecha
+    - y aumenta hacia abajo
+    - se trabaja en puntos PDF
+    """
+
+    documento = fitz.open(pdf_entrada)
+
+    # Última página del PDF
+    pagina = documento[-1]
+
+    # =====================================================
+    # POSICIÓN DE LA FIRMA
+    # =====================================================
+    # Ajusta estos valores según tu plantilla.
+    # Esta posición coloca la firma en la parte inferior derecha.
+    x = 360
+    y = 680
+    ancho = 170
+    alto = 70
+
+    rectangulo_firma = fitz.Rect(
+        x,
+        y,
+        x + ancho,
+        y + alto
+    )
+
+    pagina.insert_image(
+        rectangulo_firma,
+        filename=imagen_firma,
+        keep_proportion=True
+    )
+
+    documento.save(pdf_salida)
+    documento.close()
+
+ 
+
+    # =====================================================
+    # POSICIÓN DE LA FIRMA
+    # =====================================================
+    # x = izquierda / derecha
+    # y = arriba / abajo
+    # ancho y alto = tamaño de la firma
+
+    x = 360
+    y = 680
+    ancho = 170
+    alto = 70
+
+    rectangulo_firma = fitz.Rect(
+        x,
+        y,
+        x + ancho,
+        y + alto
+    )
+
+    pagina.insert_image(
+        rectangulo_firma,
+        filename=imagen_firma,
+        keep_proportion=True
+    )
+
+    documento.save(pdf_salida)
+    documento.close()
+
+
+# =====================================================
+# firma electrónica automática
+# =====================================================
+
+@app.route("/api/admin/solicitudes/<int:solicitud_id>/firma-electronica", methods=["POST"])
+@token_requerido
+@roles_permitidos("administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics")
+def subir_firma_electronica_y_generar_pdf(solicitud_id):
+    usuario_actual = request.usuario_actual
+    rol_actual = usuario_actual["rol"]
+
+    if "firma" not in request.files:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "debe seleccionar una imagen de firma."
+        }), 400
+
+    firma = request.files["firma"]
+
+    if firma is None or not firma.filename:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "debe seleccionar una imagen válida."
+        }), 400
+
+    nombre_firma = secure_filename(firma.filename)
+    extension = os.path.splitext(nombre_firma)[1].lower()
+
+    extensiones_validas = [".png", ".jpg", ".jpeg"]
+
+    if extension not in extensiones_validas:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "solo se permiten firmas en formato PNG, JPG o JPEG."
+        }), 400
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                id,
+                codigo_solicitud,
+                estado,
+                etapa_actual,
+                bloqueada
+            from solicitudes
+            where id = %s
+            limit 1;
+        """, (solicitud_id,))
+
+        solicitud = cursor.fetchone()
+
+        if solicitud is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "solicitud no encontrada."
+            }), 404
+
+        if solicitud["bloqueada"]:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "la solicitud se encuentra bloqueada."
+            }), 409
+
+                # =====================================================
+        # Crear nombres y rutas
+        # =====================================================
+
+        nombre_base = f"{solicitud['codigo_solicitud']}_{rol_actual}_firma_electronica"
+
+        nombre_imagen_firma = f"{nombre_base}{extension}"
+        ruta_imagen_firma = os.path.join(FIRMADOS_FOLDER, nombre_imagen_firma)
+
+        nombre_pdf_firmado = f"{nombre_base}.pdf"
+        ruta_pdf_firmado = os.path.join(FIRMADOS_FOLDER, nombre_pdf_firmado)
+
+        # =====================================================
+        # Generar PDF base temporal desde la misma función del sistema
+        # =====================================================
+        # Tu endpoint normal /pdf genera el archivo en memoria con BytesIO,
+        # por eso aquí se genera nuevamente el PDF base y se guarda temporalmente
+        # en DOCUMENTOS_FOLDER para poder insertar la imagen de firma con PyMuPDF.
+        # =====================================================
+
+        solicitud_pdf, paginas_web, error_pdf = obtener_solicitud_completa_para_pdf(solicitud_id)
+
+        if error_pdf:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": error_pdf
+            }), 404
+
+        incluir_seccion_tics = rol_actual == "analista_tics"
+
+        pdf_buffer = generar_pdf_solicitud_a4(
+            solicitud_pdf,
+            paginas_web,
+            incluir_seccion_tics=incluir_seccion_tics
+        )
+
+        nombre_pdf_generado = f"{solicitud['codigo_solicitud']}_base.pdf"
+        ruta_pdf_generado = os.path.join(DOCUMENTOS_FOLDER, nombre_pdf_generado)
+
+        with open(ruta_pdf_generado, "wb") as archivo_pdf_base:
+            archivo_pdf_base.write(pdf_buffer.getvalue())
+
+        # =====================================================
+        # Guardar imagen de firma
+        # =====================================================
+
+        firma.save(ruta_imagen_firma)
+
+        # =====================================================
+        # Colocar firma en el PDF generado
+        # =====================================================
+
+        colocar_firma_en_pdf(
+            pdf_entrada=ruta_pdf_generado,
+            imagen_firma=ruta_imagen_firma,
+            pdf_salida=ruta_pdf_firmado
+        )
+
+        # =====================================================
+        # Validar que el PDF firmado realmente se haya creado
+        # =====================================================
+
+        if not os.path.exists(ruta_pdf_firmado):
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no se pudo generar el PDF firmado electrónicamente."
+            }), 500
+
+        # =====================================================
+        # Registrar PDF firmado electrónicamente
+        # =====================================================
+
+        cursor.execute("""
+            insert into solicitud_documentos (
+                solicitud_id,
+                etapa,
+                rol_firmante,
+                usuario_id,
+                tipo_documento,
+                nombre_archivo,
+                ruta_archivo,
+                mime_type,
+                firmado,
+                firma_validada,
+                observacion
+            ) values (
+                %s, %s, %s, %s, %s, %s, %s, %s, 1, 1, %s
+            );
+        """, (
+            solicitud_id,
+            solicitud["etapa_actual"],
+            rol_actual,
+            usuario_actual["id"],
+            "pdf_firmado_electronico",
+            nombre_pdf_firmado,
+            ruta_pdf_firmado,
+            "application/pdf",
+            "PDF generado por el sistema con firma electrónica colocada automáticamente."
+        ))
+
+        documento_id = cursor.lastrowid
+
+        conexion.commit()
+
+        cursor.close()
+        conexion.close()
+
+        registrar_auditoria(
+            usuario_id=usuario_actual["id"],
+            solicitud_id=solicitud_id,
+            modulo="documentos",
+            accion="generar_pdf_firmado_electronico",
+            descripcion=f"firma electrónica colocada automáticamente por rol {rol_actual}",
+            datos_anteriores=None,
+            datos_nuevos={
+                "documento_id": documento_id,
+                "tipo_documento": "pdf_firmado_electronico",
+                "nombre_archivo": nombre_pdf_firmado,
+                "rol_firmante": rol_actual,
+                "etapa": solicitud["etapa_actual"],
+                "pdf_base": nombre_pdf_generado,
+                "imagen_firma": nombre_imagen_firma
+            }
+        )
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "firma electrónica colocada correctamente en el PDF.",
+            "documento": {
+                "id": documento_id,
+                "solicitud_id": solicitud_id,
+                "tipo_documento": "pdf_firmado_electronico",
+                "nombre_archivo": nombre_pdf_firmado,
+                "rol_firmante": rol_actual,
+                "etapa": solicitud["etapa_actual"],
+                "firmado": True,
+                "firma_validada": True
+            }
+        }), 201
+
+    except Error as error:
+        try:
+            conexion.rollback()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al registrar la firma electrónica.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        try:
+            conexion.rollback()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al colocar la firma electrónica.",
+            "error": str(error)
+        }), 500
+# =====================================================
+# carga de documentos firmados
+# =====================================================
+
+@app.route("/api/admin/solicitudes/<int:solicitud_id>/documentos", methods=["POST"])
+@token_requerido
+@roles_permitidos("administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics")
+def subir_documento_firmado(solicitud_id):
+    usuario_actual = request.usuario_actual
+    rol_actual = usuario_actual["rol"]
+
+    tipo_documento = limpiar_texto(request.args.get("tipo_documento"))
+    nombre_archivo_param = limpiar_texto(request.args.get("nombre_archivo")) or "documento.pdf"
+    observacion = normalizar_espacios(request.args.get("observacion") or "")
+
+    tipos_validos = [
+        "pdf_firmado_manual",
+        "pdf_firmado_electronico",
+        "pdf_tics",
+        "pdf_final"
+    ]
+
+    if tipo_documento not in tipos_validos:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "tipo de documento no válido.",
+            "tipos_validos": tipos_validos
+        }), 400
+
+    archivo_bytes = request.get_data()
+
+    if not archivo_bytes:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "debe seleccionar un archivo PDF."
+        }), 400
+
+    if not archivo_bytes.startswith(b"%PDF"):
+        return jsonify({
+            "estado": "error",
+            "mensaje": "solo se permiten archivos PDF válidos."
+        }), 400
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                id,
+                codigo_solicitud,
+                estado,
+                etapa_actual,
+                bloqueada
+            from solicitudes
+            where id = %s
+            limit 1;
+        """, (solicitud_id,))
+
+        solicitud = cursor.fetchone()
+
+        if solicitud is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "solicitud no encontrada."
+            }), 404
+
+        nombre_seguro = secure_filename(nombre_archivo_param)
+        extension = os.path.splitext(nombre_seguro)[1].lower() or ".pdf"
+
+        nombre_archivo = f"{solicitud['codigo_solicitud']}_{rol_actual}_{tipo_documento}{extension}"
+        ruta_archivo = os.path.join(FIRMADOS_FOLDER, nombre_archivo)
+
+        with open(ruta_archivo, "wb") as f:
+            f.write(archivo_bytes)
+
+        cursor.execute("""
+            insert into solicitud_documentos (
+                solicitud_id,
+                etapa,
+                rol_firmante,
+                usuario_id,
+                tipo_documento,
+                nombre_archivo,
+                ruta_archivo,
+                mime_type,
+                firmado,
+                firma_validada,
+                observacion
+            ) values (
+                %s, %s, %s, %s, %s, %s, %s, %s, 1, 1, %s
+            );
+        """, (
+            solicitud_id,
+            solicitud["etapa_actual"],
+            rol_actual,
+            usuario_actual["id"],
+            tipo_documento,
+            nombre_archivo,
+            ruta_archivo,
+            "application/pdf",
+            observacion
+        ))
+
+        documento_id = cursor.lastrowid
+
+        conexion.commit()
+
+        cursor.close()
+        conexion.close()
+
+        registrar_auditoria(
+            usuario_id=usuario_actual["id"],
+            solicitud_id=solicitud_id,
+            modulo="documentos",
+            accion="subir_documento_firmado",
+            descripcion=f"documento firmado subido por rol {rol_actual}",
+            datos_anteriores=None,
+            datos_nuevos={
+                "documento_id": documento_id,
+                "tipo_documento": tipo_documento,
+                "nombre_archivo": nombre_archivo,
+                "rol_firmante": rol_actual,
+                "etapa": solicitud["etapa_actual"]
+            }
+        )
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "documento firmado subido correctamente.",
+            "documento": {
+                "id": documento_id,
+                "solicitud_id": solicitud_id,
+                "tipo_documento": tipo_documento,
+                "nombre_archivo": nombre_archivo,
+                "rol_firmante": rol_actual,
+                "etapa": solicitud["etapa_actual"],
+                "firmado": True,
+                "firma_validada": True
+            }
+        }), 201
+
+    except Error as error:
+        try:
+            conexion.rollback()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al registrar el documento firmado.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        try:
+            conexion.rollback()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al subir el documento.",
+            "error": str(error)
+        }), 500
+# =====================================================
+# descargar último documento firmado de la solicitud
+# =====================================================
+
+@app.route("/api/admin/solicitudes/<int:solicitud_id>/documento-actual", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics")
+def descargar_documento_actual_solicitud(solicitud_id):
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        # =====================================================
+        # verificar que exista la solicitud
+        # =====================================================
+
+        cursor.execute("""
+            select
+                id,
+                codigo_solicitud,
+                estado,
+                etapa_actual
+            from solicitudes
+            where id = %s
+            limit 1;
+        """, (solicitud_id,))
+
+        solicitud = cursor.fetchone()
+
+        if solicitud is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "solicitud no encontrada."
+            }), 404
+
+        # =====================================================
+        # buscar el último pdf firmado cargado
+        # =====================================================
+
+        cursor.execute("""
+            select
+                id,
+                solicitud_id,
+                etapa,
+                rol_firmante,
+                usuario_id,
+                tipo_documento,
+                nombre_archivo,
+                ruta_archivo,
+                mime_type,
+                firmado,
+                firma_validada,
+                observacion,
+                created_at,
+                updated_at
+            from solicitud_documentos
+            where solicitud_id = %s
+              and ruta_archivo is not null
+              and ruta_archivo <> ''
+              and mime_type = 'application/pdf'
+              and tipo_documento in (
+                'pdf_firmado_manual',
+                'pdf_firmado_electronico',
+                'pdf_tics',
+                'pdf_final'
+              )
+            order by id desc
+            limit 1;
+        """, (solicitud_id,))
+
+        documento = cursor.fetchone()
+
+        cursor.close()
+        conexion.close()
+
+        if documento is None:
+            return jsonify({
+                "estado": "error",
+                "mensaje": "todavía no existe un PDF firmado cargado para esta solicitud."
+            }), 404
+
+        ruta_archivo = documento.get("ruta_archivo")
+
+        if not ruta_archivo:
+            return jsonify({
+                "estado": "error",
+                "mensaje": "el documento no tiene ruta registrada."
+            }), 404
+
+        ruta_archivo = os.path.normpath(ruta_archivo)
+
+        if not os.path.exists(ruta_archivo):
+            return jsonify({
+                "estado": "error",
+                "mensaje": "el archivo firmado no existe físicamente en el servidor.",
+                "ruta_archivo": ruta_archivo
+            }), 404
+
+        nombre_descarga = documento.get("nombre_archivo") or f"{solicitud['codigo_solicitud']}-firmado.pdf"
+
+        return send_file(
+            ruta_archivo,
+            mimetype=documento.get("mime_type") or "application/pdf",
+            as_attachment=True,
+            download_name=nombre_descarga
+        )
+
+    except Error as error:
+        try:
+            cursor.close()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al descargar el documento firmado.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        try:
+            cursor.close()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al descargar el documento firmado.",
+            "error": str(error)
+        }), 500
+    
+
+# =====================================================
+# aprobación de solicitud
+# =====================================================
+
+@app.route("/api/admin/solicitudes/<int:solicitud_id>/aprobar", methods=["PUT"])
+@token_requerido
+@roles_permitidos("administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics")
+def aprobar_solicitud(solicitud_id):
+    usuario_actual = request.usuario_actual
+    rol_actual = usuario_actual["rol"]
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        # =====================================================
+        # Obtener solicitud actual
+        # =====================================================
+
+        cursor.execute("""
+            select
+                id,
+                codigo_solicitud,
+                nombres_completos,
+                cedula,
+                correo_institucional,
+                estado,
+                etapa_actual,
+                bloqueada
+            from solicitudes
+            where id = %s
+            limit 1;
+        """, (solicitud_id,))
+
+        solicitud = cursor.fetchone()
+
+        if solicitud is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "solicitud no encontrada."
+            }), 404
+
+        if solicitud["bloqueada"]:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "la solicitud se encuentra bloqueada y no puede ser procesada."
+            }), 409
+
+        estado_anterior = solicitud["estado"]
+        etapa_anterior = solicitud["etapa_actual"]
+
+        # =====================================================
+        # Validar rol y estado actual
+        # =====================================================
+
+        regla = obtener_siguiente_estado_por_rol(estado_anterior, rol_actual)
+
+        if regla is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no tiene permisos para aprobar esta solicitud en su estado actual.",
+                "rol_actual": rol_actual,
+                "estado_actual": estado_anterior
+            }), 403
+
+        # =====================================================
+        # Validar documento firmado obligatorio
+        # =====================================================
+
+        cursor.execute("""
+            select
+                id,
+                tipo_documento,
+                nombre_archivo,
+                ruta_archivo,
+                mime_type,
+                firmado,
+                firma_validada
+            from solicitud_documentos
+            where solicitud_id = %s
+              and mime_type = 'application/pdf'
+              and (
+                    firmado = 1
+                    or firma_validada = 1
+                    or tipo_documento in (
+                        'pdf_firmado_manual',
+                        'pdf_firmado_electronico',
+                        'pdf_tics',
+                        'pdf_final'
+                    )
+              )
+            order by id desc
+            limit 1;
+        """, (solicitud_id,))
+
+        documento_firmado = cursor.fetchone()
+
+        if documento_firmado is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "antes de aprobar debe existir un PDF firmado electrónicamente con FirmaEC.",
+                "requisito": "pdf_firmado_electronico_firmaec",
+                "rol_actual": rol_actual,
+                "estado_actual": estado_anterior
+            }), 409
+
+        nuevo_estado = regla["nuevo_estado"]
+        nueva_etapa = regla["nueva_etapa"]
+
+        # =====================================================
+        # Actualizar flujo de solicitud
+        # =====================================================
+
+        cursor.execute("""
+            update solicitudes
+            set
+                estado = %s,
+                etapa_actual = %s,
+                updated_at = now()
+            where id = %s;
+        """, (nuevo_estado, nueva_etapa, solicitud_id))
+
+        conexion.commit()
+
+        cursor.close()
+        conexion.close()
+
+        # =====================================================
+        # Auditoría
+        # =====================================================
+
+        registrar_auditoria(
+            usuario_id=usuario_actual["id"],
+            solicitud_id=solicitud_id,
+            modulo="flujo_solicitud",
+            accion="aprobar_solicitud",
+            descripcion=f"solicitud {solicitud['codigo_solicitud']} aprobada por rol {rol_actual}",
+            datos_anteriores={
+                "estado": estado_anterior,
+                "etapa_actual": etapa_anterior
+            },
+            datos_nuevos={
+                "estado": nuevo_estado,
+                "etapa_actual": nueva_etapa,
+                "documento_firmado_id": documento_firmado["id"],
+                "tipo_documento": documento_firmado["tipo_documento"],
+                "nombre_archivo": documento_firmado["nombre_archivo"]
+            }
+        )
+
+        # =====================================================
+        # Correo al solicitante cuando TICS finaliza todo
+        # =====================================================
+
+        correo_enviado = False
+        error_correo = None
+
+        if (
+            rol_actual == "analista_tics"
+            and estado_anterior == "pendiente_ejecucion_tics"
+            and nuevo_estado == "finalizada"
+        ):
+            try:
+                enviar_correo_finalizacion_solicitud(solicitud)
+                correo_enviado = True
+
+                registrar_auditoria(
+                    usuario_id=usuario_actual["id"],
+                    solicitud_id=solicitud_id,
+                    modulo="correo",
+                    accion="enviar_correo_finalizacion",
+                    descripcion=f"correo de finalización enviado a {solicitud['correo_institucional']}",
+                    datos_anteriores=None,
+                    datos_nuevos={
+                        "correo_destino": solicitud["correo_institucional"],
+                        "codigo_solicitud": solicitud["codigo_solicitud"],
+                        "estado": nuevo_estado
+                    }
+                )
+
+            except Exception as error:
+                correo_enviado = False
+                error_correo = str(error)
+
+                registrar_auditoria(
+                    usuario_id=usuario_actual["id"],
+                    solicitud_id=solicitud_id,
+                    modulo="correo",
+                    accion="error_correo_finalizacion",
+                    descripcion=f"no se pudo enviar correo de finalización a {solicitud['correo_institucional']}",
+                    datos_anteriores=None,
+                    datos_nuevos={
+                        "correo_destino": solicitud["correo_institucional"],
+                        "codigo_solicitud": solicitud["codigo_solicitud"],
+                        "error": error_correo
+                    }
+                )
+
+        mensaje_respuesta = "solicitud aprobada correctamente."
+
+        if (
+            rol_actual == "analista_tics"
+            and estado_anterior == "pendiente_tics"
+            and nuevo_estado == "pendiente_ejecucion_tics"
+        ):
+            mensaje_respuesta = "validación TICS aprobada correctamente. la solicitud pasa a ejecución técnica."
+
+        if (
+            rol_actual == "analista_tics"
+            and estado_anterior == "pendiente_ejecucion_tics"
+            and nuevo_estado == "finalizada"
+        ):
+            if correo_enviado:
+                mensaje_respuesta = "la solicitud fue finalizada correctamente por TICS y se notificó al solicitante."
+            else:
+                mensaje_respuesta = "la solicitud fue finalizada correctamente por TICS, pero no se pudo enviar el correo al solicitante."
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": mensaje_respuesta,
+            "correo_enviado": correo_enviado,
+            "error_correo": error_correo,
+            "solicitud": {
+                "id": solicitud_id,
+                "codigo_solicitud": solicitud["codigo_solicitud"],
+                "correo_destino": solicitud.get("correo_institucional"),
+                "estado_anterior": estado_anterior,
+                "estado_actual": nuevo_estado,
+                "etapa_actual": nueva_etapa,
+                "documento_firmado": {
+                    "id": documento_firmado["id"],
+                    "tipo_documento": documento_firmado["tipo_documento"],
+                    "nombre_archivo": documento_firmado["nombre_archivo"]
+                }
+            }
+        }), 200
+
+    except Error as error:
+        try:
+            conexion.rollback()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al aprobar la solicitud.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        try:
+            conexion.rollback()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al aprobar la solicitud.",
+            "error": str(error)
+        }), 500
+
+# =====================================================
+# envío de correo por rechazo de solicitud
+# =====================================================
+
+def enviar_correo_rechazo_solicitud(solicitud, motivo, rol_rechazo):
+    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
+        print("configuración SMTP incompleta. No se envió el correo de rechazo.")
+        return False
+
+    correo_destino = limpiar_texto(solicitud.get("correo_institucional")).lower()
+    if not correo_destino:
+        print("la solicitud no tiene correo registrado.")
+        return False
+
+    codigo_solicitud = solicitud.get("codigo_solicitud", "")
+    nombres = solicitud.get("nombres_completos", "")
+    fecha_actual = datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
+    anio_actual = datetime.datetime.now().year
+    nombres_seguro = html.escape(str(nombres))
+    codigo_seguro = html.escape(str(codigo_solicitud))
+    motivo_seguro = html.escape(str(motivo))
+    rol_seguro = html.escape(str(rol_rechazo))
+    fecha_segura = html.escape(str(fecha_actual))
+    logo_tag = _logo_email_tag()
+
+    asunto = f"Solicitud rechazada - {codigo_solicitud} | INAMHI"
+
+    cuerpo_texto = (
+        f"Estimado/a {nombres},\n\n"
+        f"Su solicitud {codigo_solicitud} fue rechazada.\n\n"
+        f"Rechazado por: {rol_rechazo}\n"
+        f"Fecha: {fecha_actual}\n\n"
+        f"Motivo:\n{motivo}\n\n"
+        f"Puede registrar una nueva solicitud con la información corregida.\n\n"
+        f"INAMHI - mensaje automático, no responda."
+    )
+
+    cuerpo_html = f"""<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:'Segoe UI',Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:32px 0;">
+  <tr><td align="center">
+    <table width="560" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 4px 18px rgba(0,0,0,0.08);">
+
+      <!-- CABECERA -->
+      <tr>
+        <td style="background:#7f1d1d;padding:28px 32px;text-align:center;">
+          {logo_tag}
+          <p style="color:#fff;margin:0;font-size:18px;font-weight:700;">Solicitud rechazada</p>
+          <p style="color:#fca5a5;margin:6px 0 0;font-size:13px;">Solicitud de Liberación Web &mdash; INAMHI</p>
+        </td>
+      </tr>
+
+      <!-- CUERPO -->
+      <tr>
+        <td style="padding:28px 32px;">
+          <p style="margin:0 0 20px;font-size:15px;color:#1e293b;">
+            Estimado/a <strong>{nombres_seguro}</strong>, su solicitud no fue aprobada.
+          </p>
+
+          <!-- Datos -->
+          <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #fee2e2;border-radius:10px;overflow:hidden;margin-bottom:18px;">
+            <tr style="background:#fef2f2;">
+              <td style="padding:11px 16px;font-size:13px;color:#64748b;font-weight:600;border-bottom:1px solid #fee2e2;width:40%;">Código</td>
+              <td style="padding:11px 16px;font-size:13px;color:#0f172a;font-weight:700;border-bottom:1px solid #fee2e2;font-family:monospace;">{codigo_seguro}</td>
+            </tr>
+            <tr>
+              <td style="padding:11px 16px;font-size:13px;color:#64748b;font-weight:600;border-bottom:1px solid #fee2e2;">Rechazado por</td>
+              <td style="padding:11px 16px;font-size:13px;color:#0f172a;border-bottom:1px solid #fee2e2;">{rol_seguro}</td>
+            </tr>
+            <tr style="background:#fef2f2;">
+              <td style="padding:11px 16px;font-size:13px;color:#64748b;font-weight:600;">Fecha</td>
+              <td style="padding:11px 16px;font-size:13px;color:#0f172a;">{fecha_segura}</td>
+            </tr>
+          </table>
+
+          <!-- Motivo -->
+          <table width="100%" cellpadding="0" cellspacing="0" style="background:#fef2f2;border-left:4px solid #ef4444;border-radius:0 10px 10px 0;">
+            <tr>
+              <td style="padding:16px 18px;">
+                <p style="margin:0 0 8px;font-size:13px;font-weight:700;color:#7f1d1d;text-transform:uppercase;letter-spacing:0.5px;">Motivo del rechazo</p>
+                <p style="margin:0;font-size:14px;line-height:1.6;color:#991b1b;">{motivo_seguro}</p>
+              </td>
+            </tr>
+          </table>
+
+          <p style="margin:18px 0 0;font-size:13px;color:#64748b;">
+            Corrija la información indicada y registre una nueva solicitud.
+            Para consultas comuníquese con TICS.
+          </p>
+        </td>
+      </tr>
+
+      <!-- FOOTER -->
+      <tr>
+        <td style="background:#f8fafc;padding:14px 32px;border-top:1px solid #e2e8f0;text-align:center;">
+          <p style="margin:0;font-size:11px;color:#94a3b8;">
+            &copy; {anio_actual} Instituto Nacional de Meteorología e Hidrología &mdash; Ecuador<br>
+            Mensaje automático, por favor no responda.
+          </p>
+        </td>
+      </tr>
+
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>"""
+
+    try:
+        enviar_correo(
+            destinatario=correo_destino,
+            asunto=asunto,
+            cuerpo=cuerpo_texto,
+            cuerpo_html=cuerpo_html
+        )
+        print(f"correo de rechazo enviado a {correo_destino}")
+        return True
+    except Exception as error:
+        print("error al enviar correo de rechazo:", error)
+        return False
+# =====================================================
+# correo de finalización / aprobación total de solicitud
+# =====================================================
+def enviar_correo_finalizacion_solicitud(solicitud):
+    destinatario = limpiar_texto(solicitud.get("correo_institucional")).lower()
+    if not destinatario:
+        raise Exception("la solicitud no tiene correo institucional registrado.")
+
+    codigo_solicitud = solicitud.get("codigo_solicitud", "")
+    nombres = solicitud.get("nombres_completos") or "usuario/a"
+    fecha_actual = datetime.datetime.now().strftime("%d/%m/%Y %H:%M")
+    anio_actual = datetime.datetime.now().year
+    nombres_seguro = html.escape(str(nombres))
+    codigo_seguro = html.escape(str(codigo_solicitud))
+    fecha_segura = html.escape(str(fecha_actual))
+    logo_tag = _logo_email_tag()
+
+    asunto = f"Solicitud aprobada - {codigo_solicitud} | INAMHI"
+
+    cuerpo_texto = (
+        f"Estimado/a {nombres},\n\n"
+        f"Su solicitud {codigo_solicitud} fue aprobada y finalizada correctamente.\n\n"
+        f"Estado: Finalizada\n"
+        f"Fecha: {fecha_actual}\n\n"
+        f"Los accesos han sido configurados por TICS.\n"
+        f"Si no puede acceder en las próximas 2 horas hábiles, comuníquese con TICS.\n\n"
+        f"INAMHI - mensaje automático, no responda."
+    )
+
+    cuerpo_html = f"""<!DOCTYPE html>
+<html lang="es">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"></head>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:'Segoe UI',Arial,sans-serif;">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:32px 0;">
+  <tr><td align="center">
+    <table width="560" cellpadding="0" cellspacing="0" style="background:#fff;border-radius:14px;overflow:hidden;box-shadow:0 4px 18px rgba(0,0,0,0.08);">
+
+      <!-- CABECERA -->
+      <tr>
+        <td style="background:#064e3b;padding:28px 32px;text-align:center;">
+          {logo_tag}
+          <p style="color:#fff;margin:0;font-size:18px;font-weight:700;">Solicitud aprobada</p>
+          <p style="color:#6ee7b7;margin:6px 0 0;font-size:13px;">Solicitud de Liberación Web &mdash; INAMHI</p>
+        </td>
+      </tr>
+
+      <!-- CUERPO -->
+      <tr>
+        <td style="padding:28px 32px;">
+          <p style="margin:0 0 20px;font-size:15px;color:#1e293b;">
+            Estimado/a <strong>{nombres_seguro}</strong>, su solicitud fue aprobada y finalizada.
+          </p>
+
+          <!-- Datos -->
+          <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid #d1fae5;border-radius:10px;overflow:hidden;margin-bottom:18px;">
+            <tr style="background:#ecfdf5;">
+              <td style="padding:11px 16px;font-size:13px;color:#64748b;font-weight:600;border-bottom:1px solid #d1fae5;width:40%;">Código</td>
+              <td style="padding:11px 16px;font-size:13px;color:#0f172a;font-weight:700;border-bottom:1px solid #d1fae5;font-family:monospace;">{codigo_seguro}</td>
+            </tr>
+            <tr>
+              <td style="padding:11px 16px;font-size:13px;color:#64748b;font-weight:600;border-bottom:1px solid #d1fae5;">Estado</td>
+              <td style="padding:11px 16px;border-bottom:1px solid #d1fae5;">
+                <span style="background:#dcfce7;color:#166534;font-size:12px;font-weight:700;padding:4px 12px;border-radius:50px;">Finalizada</span>
+              </td>
+            </tr>
+            <tr style="background:#ecfdf5;">
+              <td style="padding:11px 16px;font-size:13px;color:#64748b;font-weight:600;">Fecha</td>
+              <td style="padding:11px 16px;font-size:13px;color:#0f172a;">{fecha_segura}</td>
+            </tr>
+          </table>
+
+          <p style="margin:0;font-size:13px;color:#64748b;line-height:1.6;">
+            Los accesos han sido configurados por TICS. Si no puede acceder,
+            comuníquese con el área de TICS.
+          </p>
+        </td>
+      </tr>
+
+      <!-- FOOTER -->
+      <tr>
+        <td style="background:#f8fafc;padding:14px 32px;border-top:1px solid #e2e8f0;text-align:center;">
+          <p style="margin:0;font-size:11px;color:#94a3b8;">
+            &copy; {anio_actual} Instituto Nacional de Meteorología e Hidrología &mdash; Ecuador<br>
+            Mensaje automático, por favor no responda.
+          </p>
+        </td>
+      </tr>
+
+    </table>
+  </td></tr>
+</table>
+</body>
+</html>"""
+
+    enviar_correo(
+        destinatario=destinatario,
+        asunto=asunto,
+        cuerpo=cuerpo_texto,
+        cuerpo_html=cuerpo_html
+    )
+# =====================================================
+# rechazo de solicitud
+# =====================================================
+
+@app.route("/api/admin/solicitudes/<int:solicitud_id>/rechazar", methods=["PUT"])
+@token_requerido
+@roles_permitidos("jefe_inmediato", "maxima_autoridad", "analista_tics")
+def rechazar_solicitud(solicitud_id):
+    usuario_actual = request.usuario_actual
+    rol_actual = usuario_actual["rol"]
+
+    data = request.get_json() or {}
+    motivo = normalizar_espacios(data.get("motivo"))
+
+    if not motivo:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el motivo del rechazo es obligatorio."
+        }), 400
+
+    if len(motivo) < 10:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el motivo del rechazo debe tener mínimo 10 caracteres."
+        }), 400
+
+    if len(motivo) > 1000:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el motivo del rechazo no puede superar 1000 caracteres."
+        }), 400
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        # =====================================================
+        # Obtener solicitud actual
+        # =====================================================
+
+        cursor.execute("""
+            select
+                id,
+                codigo_solicitud,
+                nombres_completos,
+                correo_institucional,
+                estado,
+                etapa_actual,
+                bloqueada
+            from solicitudes
+            where id = %s
+            limit 1;
+        """, (solicitud_id,))
+
+        solicitud = cursor.fetchone()
+
+        if solicitud is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "solicitud no encontrada."
+            }), 404
+
+        if solicitud["bloqueada"]:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "la solicitud se encuentra bloqueada y no puede ser procesada."
+            }), 409
+
+        estado_anterior = solicitud["estado"]
+        etapa_anterior = solicitud["etapa_actual"]
+
+        # =====================================================
+        # Reglas de rechazo por rol
+        # =====================================================
+
+        reglas_rechazo = {
+            "jefe_inmediato": {
+                "estado_permitido": "pendiente_jefe_inmediato",
+                "nuevo_estado": "rechazada_jefe_inmediato",
+                "nueva_etapa": "jefe_inmediato",
+                "mensaje": "solicitud rechazada por el jefe inmediato."
+            },
+            "maxima_autoridad": {
+                "estado_permitido": "pendiente_maxima_autoridad",
+                "nuevo_estado": "rechazada_maxima_autoridad",
+                "nueva_etapa": "maxima_autoridad",
+                "mensaje": "solicitud rechazada por la máxima autoridad."
+            },
+            "analista_tics": {
+                "estado_permitido": "pendiente_tics",
+                "nuevo_estado": "rechazada_tics",
+                "nueva_etapa": "tics",
+                "mensaje": "solicitud rechazada por TICS."
+            }
+        }
+
+        regla = reglas_rechazo.get(rol_actual)
+
+        if regla is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "rol no autorizado para rechazar solicitudes."
+            }), 403
+
+        if estado_anterior != regla["estado_permitido"]:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": f"la solicitud no puede ser rechazada por {rol_actual} en el estado actual.",
+                "estado_actual": estado_anterior,
+                "estado_requerido": regla["estado_permitido"]
+            }), 409
+
+        # =====================================================
+        # Actualizar solicitud
+        # =====================================================
+
+        cursor.execute("""
+            update solicitudes
+            set
+                estado = %s,
+                etapa_actual = %s,
+                observacion_general = %s,
+                updated_at = current_timestamp
+            where id = %s;
+        """, (
+            regla["nuevo_estado"],
+            regla["nueva_etapa"],
+            motivo,
+            solicitud_id
+        ))
+
+        # =====================================================
+        # Registrar auditoría
+        # =====================================================
+
+        datos_anteriores = {
+            "estado": estado_anterior,
+            "etapa_actual": etapa_anterior
+        }
+
+        datos_nuevos = {
+            "estado": regla["nuevo_estado"],
+            "etapa_actual": regla["nueva_etapa"],
+            "motivo": motivo,
+            "rechazado_por": rol_actual,
+            "usuario_id": usuario_actual["id"]
+        }
+
+        cursor.execute("""
+            insert into auditoria (
+                usuario_id,
+                solicitud_id,
+                modulo,
+                accion,
+                descripcion,
+                datos_anteriores,
+                datos_nuevos,
+                ip_origen,
+                user_agent
+            ) values (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s
+            );
+        """, (
+            usuario_actual["id"],
+            solicitud_id,
+            "flujo_solicitud",
+            "rechazar_solicitud",
+            f"{regla['mensaje']} código: {solicitud['codigo_solicitud']}",
+            json.dumps(datos_anteriores, ensure_ascii=False),
+            json.dumps(datos_nuevos, ensure_ascii=False),
+            request.remote_addr,
+            request.headers.get("User-Agent")
+        ))
+
+        conexion.commit()
+
+       
+       # =====================================================
+        # Enviar correo automático al solicitante
+        # =====================================================
+
+        correo_enviado = False
+        error_correo = None
+
+        try:
+            nombre_rechazador = (
+                f"{usuario_actual.get('nombres', '')} {usuario_actual.get('apellidos', '')}".strip()
+                or rol_actual
+            )
+            correo_enviado = enviar_correo_rechazo_solicitud(
+                solicitud=solicitud,
+                motivo=motivo,
+                rol_rechazo=nombre_rechazador
+            )
+            print("==============================================")
+            print("RESULTADO CORREO DE RECHAZO")
+            print("DESTINATARIO:", solicitud.get("correo_institucional"))
+            print("CORREO ENVIADO:", correo_enviado)
+            print("ERROR CORREO:", error_correo)
+            print("==============================================")
+        except Exception as error_email:
+            correo_enviado = False
+            error_correo = str(error_email)
+            print("error al enviar correo de rechazo:", error_correo)
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": regla["mensaje"],
+            "correo_enviado": correo_enviado,
+            "error_correo": error_correo,
+            "solicitud": {
+                "id": solicitud_id,
+                "codigo_solicitud": solicitud["codigo_solicitud"],
+                "correo_destino": solicitud["correo_institucional"],
+                "estado_anterior": estado_anterior,
+                "estado_actual": regla["nuevo_estado"],
+                "etapa_actual": regla["nueva_etapa"],
+                "motivo": motivo
+            }
+        }), 200
+
+    except Error as error:
+        try:
+            conexion.rollback()
+            cursor.close()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al rechazar la solicitud.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        try:
+            conexion.rollback()
+            cursor.close()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al rechazar la solicitud.",
+            "error": str(error)
+        }), 500
+       
+
+
+# =====================================================
+# manejo de errores
+# =====================================================
+
+@app.errorhandler(404)
+def error_404(error):
+    return jsonify({
+        "estado": "error",
+        "mensaje": "ruta no encontrada."
+    }), 404
+
+
+@app.errorhandler(405)
+def error_405(error):
+    return jsonify({
+        "estado": "error",
+        "mensaje": "método no permitido para esta ruta."
+    }), 405
+
+
+@app.errorhandler(413)
+def error_413(error):
+    return jsonify({
+        "estado": "error",
+        "mensaje": "el archivo supera el tamaño máximo permitido de 15 MB."
+    }), 413
+
+
+@app.errorhandler(500)
+def error_500(error):
+    return jsonify({
+        "estado": "error",
+        "mensaje": "error interno del servidor."
+    }), 500
+
+# =====================================================
+# ESTRUCTURA ORGANIZACIONAL — CRUD completo
+# Direcciones, Áreas y Cargos
+# =====================================================
+
+# ── DIRECCIONES ───────────────────────────────────────
+
+@app.route("/api/admin/estructura/direcciones", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador")
+def listar_direcciones():
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        q = limpiar_texto(request.args.get("q") or "")
+        sql = "SELECT id, nombre, estado, created_at, updated_at FROM direcciones WHERE 1=1"
+        params = []
+        if q:
+            sql += " AND nombre LIKE %s"
+            params.append(f"%{q}%")
+        sql += " ORDER BY nombre"
+        cursor.execute(sql, params)
+        datos = cursor.fetchall()
+        cursor.close(); conexion.close()
+        return jsonify({"estado": "ok", "direcciones": datos, "total": len(datos)}), 200
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+@app.route("/api/admin/estructura/direcciones", methods=["POST"])
+@token_requerido
+@roles_permitidos("administrador")
+def crear_direccion():
+    data = request.get_json() or {}
+    nombre = normalizar_espacios(data.get("nombre"))
+    estado = limpiar_texto(data.get("estado") or "activo")
+    if not nombre or len(nombre) < 3:
+        return jsonify({"estado": "error", "mensaje": "El nombre es obligatorio (mínimo 3 caracteres)."}), 400
+    if estado not in ("activo", "inactivo"):
+        estado = "activo"
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute("SELECT id FROM direcciones WHERE nombre=%s LIMIT 1", (nombre,))
+        if cursor.fetchone():
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Ya existe una dirección con ese nombre."}), 409
+        cursor.execute(
+            "INSERT INTO direcciones (nombre, estado, created_at, updated_at) VALUES (%s,%s,NOW(),NOW())",
+            (nombre, estado)
+        )
+        nuevo_id = cursor.lastrowid
+        conexion.commit(); cursor.close(); conexion.close()
+        return jsonify({"estado": "ok", "mensaje": "Dirección creada correctamente.", "id": nuevo_id}), 201
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+@app.route("/api/admin/estructura/direcciones/<int:dir_id>", methods=["PUT"])
+@token_requerido
+@roles_permitidos("administrador")
+def actualizar_direccion(dir_id):
+    data = request.get_json() or {}
+    nombre = normalizar_espacios(data.get("nombre"))
+    estado = limpiar_texto(data.get("estado") or "activo")
+    if not nombre or len(nombre) < 3:
+        return jsonify({"estado": "error", "mensaje": "El nombre es obligatorio (mínimo 3 caracteres)."}), 400
+    if estado not in ("activo", "inactivo"):
+        estado = "activo"
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute("SELECT id FROM direcciones WHERE nombre=%s AND id!=%s LIMIT 1", (nombre, dir_id))
+        if cursor.fetchone():
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Ya existe otra dirección con ese nombre."}), 409
+        cursor.execute(
+            "UPDATE direcciones SET nombre=%s, estado=%s, updated_at=NOW() WHERE id=%s",
+            (nombre, estado, dir_id)
+        )
+        if cursor.rowcount == 0:
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Dirección no encontrada."}), 404
+        conexion.commit(); cursor.close(); conexion.close()
+        return jsonify({"estado": "ok", "mensaje": "Dirección actualizada correctamente."}), 200
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+@app.route("/api/admin/estructura/direcciones/<int:dir_id>", methods=["DELETE"])
+@token_requerido
+@roles_permitidos("administrador")
+def eliminar_direccion(dir_id):
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute("SELECT COUNT(*) as c FROM areas WHERE direccion_id=%s", (dir_id,))
+        if cursor.fetchone()["c"] > 0:
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "No se puede eliminar: tiene áreas vinculadas. Elimine primero las áreas."}), 409
+        cursor.execute("DELETE FROM direcciones WHERE id=%s", (dir_id,))
+        if cursor.rowcount == 0:
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Dirección no encontrada."}), 404
+        conexion.commit(); cursor.close(); conexion.close()
+        return jsonify({"estado": "ok", "mensaje": "Dirección eliminada correctamente."}), 200
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+# ── ÁREAS ─────────────────────────────────────────────
+
+@app.route("/api/admin/estructura/areas", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador")
+def listar_areas_estructura():
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        q = limpiar_texto(request.args.get("q") or "")
+        dir_id = request.args.get("direccion_id")
+        sql = """
+            SELECT a.id, a.nombre, a.estado, a.direccion_id,
+                   d.nombre AS direccion_nombre,
+                   a.created_at, a.updated_at
+            FROM areas a
+            LEFT JOIN direcciones d ON d.id = a.direccion_id
+            WHERE 1=1
+        """
+        params = []
+        if q:
+            sql += " AND (a.nombre LIKE %s OR d.nombre LIKE %s)"
+            params += [f"%{q}%", f"%{q}%"]
+        if dir_id:
+            sql += " AND a.direccion_id = %s"
+            params.append(dir_id)
+        sql += " ORDER BY d.nombre, a.nombre"
+        cursor.execute(sql, params)
+        datos = cursor.fetchall()
+        cursor.close(); conexion.close()
+        return jsonify({"estado": "ok", "areas": datos, "total": len(datos)}), 200
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+@app.route("/api/admin/estructura/areas", methods=["POST"])
+@token_requerido
+@roles_permitidos("administrador")
+def crear_area():
+    data = request.get_json() or {}
+    nombre     = normalizar_espacios(data.get("nombre"))
+    dir_id     = data.get("direccion_id")
+    estado     = limpiar_texto(data.get("estado") or "activo")
+    if not nombre or len(nombre) < 2:
+        return jsonify({"estado": "error", "mensaje": "El nombre del área es obligatorio."}), 400
+    if not dir_id:
+        return jsonify({"estado": "error", "mensaje": "Debe seleccionar una dirección."}), 400
+    if estado not in ("activo", "inactivo"):
+        estado = "activo"
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute("SELECT id FROM areas WHERE nombre=%s AND direccion_id=%s LIMIT 1", (nombre, dir_id))
+        if cursor.fetchone():
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Ya existe un área con ese nombre en la dirección seleccionada."}), 409
+        cursor.execute(
+            "INSERT INTO areas (direccion_id, nombre, estado, created_at, updated_at) VALUES (%s,%s,%s,NOW(),NOW())",
+            (dir_id, nombre, estado)
+        )
+        nuevo_id = cursor.lastrowid
+        conexion.commit(); cursor.close(); conexion.close()
+        return jsonify({"estado": "ok", "mensaje": "Área creada correctamente.", "id": nuevo_id}), 201
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+@app.route("/api/admin/estructura/areas/<int:area_id>", methods=["PUT"])
+@token_requerido
+@roles_permitidos("administrador")
+def actualizar_area(area_id):
+    data = request.get_json() or {}
+    nombre = normalizar_espacios(data.get("nombre"))
+    dir_id = data.get("direccion_id")
+    estado = limpiar_texto(data.get("estado") or "activo")
+    if not nombre or len(nombre) < 2:
+        return jsonify({"estado": "error", "mensaje": "El nombre del área es obligatorio."}), 400
+    if not dir_id:
+        return jsonify({"estado": "error", "mensaje": "Debe seleccionar una dirección."}), 400
+    if estado not in ("activo", "inactivo"):
+        estado = "activo"
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute("SELECT id FROM areas WHERE nombre=%s AND direccion_id=%s AND id!=%s LIMIT 1", (nombre, dir_id, area_id))
+        if cursor.fetchone():
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Ya existe otra área con ese nombre en la dirección seleccionada."}), 409
+        cursor.execute(
+            "UPDATE areas SET nombre=%s, direccion_id=%s, estado=%s, updated_at=NOW() WHERE id=%s",
+            (nombre, dir_id, estado, area_id)
+        )
+        if cursor.rowcount == 0:
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Área no encontrada."}), 404
+        conexion.commit(); cursor.close(); conexion.close()
+        return jsonify({"estado": "ok", "mensaje": "Área actualizada correctamente."}), 200
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+@app.route("/api/admin/estructura/areas/<int:area_id>", methods=["DELETE"])
+@token_requerido
+@roles_permitidos("administrador")
+def eliminar_area(area_id):
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute("SELECT COUNT(*) as c FROM cargos WHERE area_id=%s", (area_id,))
+        if cursor.fetchone()["c"] > 0:
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "No se puede eliminar: tiene cargos vinculados. Elimine primero los cargos."}), 409
+        cursor.execute("SELECT COUNT(*) as c FROM area_personal WHERE area_id=%s", (area_id,))
+        if cursor.fetchone()["c"] > 0:
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "No se puede eliminar: tiene personal vinculado a esta área."}), 409
+        cursor.execute("DELETE FROM areas WHERE id=%s", (area_id,))
+        if cursor.rowcount == 0:
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Área no encontrada."}), 404
+        conexion.commit(); cursor.close(); conexion.close()
+        return jsonify({"estado": "ok", "mensaje": "Área eliminada correctamente."}), 200
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+# ── CARGOS ────────────────────────────────────────────
+
+@app.route("/api/admin/estructura/cargos", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador")
+def listar_cargos_estructura():
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        q      = limpiar_texto(request.args.get("q") or "")
+        area_id = request.args.get("area_id")
+        sql = """
+            SELECT c.id, c.nombre, c.estado, c.area_id,
+                   a.nombre AS area_nombre,
+                   d.nombre AS direccion_nombre,
+                   c.created_at, c.updated_at
+            FROM cargos c
+            LEFT JOIN areas       a ON a.id = c.area_id
+            LEFT JOIN direcciones d ON d.id = a.direccion_id
+            WHERE 1=1
+        """
+        params = []
+        if q:
+            sql += " AND (c.nombre LIKE %s OR a.nombre LIKE %s OR d.nombre LIKE %s)"
+            params += [f"%{q}%", f"%{q}%", f"%{q}%"]
+        if area_id:
+            sql += " AND c.area_id = %s"
+            params.append(area_id)
+        sql += " ORDER BY d.nombre, a.nombre, c.nombre"
+        cursor.execute(sql, params)
+        datos = cursor.fetchall()
+        cursor.close(); conexion.close()
+        return jsonify({"estado": "ok", "cargos": datos, "total": len(datos)}), 200
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+@app.route("/api/admin/estructura/cargos", methods=["POST"])
+@token_requerido
+@roles_permitidos("administrador")
+def crear_cargo():
+    data = request.get_json() or {}
+    nombre  = normalizar_espacios(data.get("nombre"))
+    area_id = data.get("area_id")
+    estado  = limpiar_texto(data.get("estado") or "activo")
+    if not nombre or len(nombre) < 2:
+        return jsonify({"estado": "error", "mensaje": "El nombre del cargo es obligatorio."}), 400
+    if not area_id:
+        return jsonify({"estado": "error", "mensaje": "Debe seleccionar un área."}), 400
+    if estado not in ("activo", "inactivo"):
+        estado = "activo"
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute("SELECT id FROM cargos WHERE nombre=%s AND area_id=%s LIMIT 1", (nombre, area_id))
+        if cursor.fetchone():
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Ya existe ese cargo en el área seleccionada."}), 409
+        cursor.execute(
+            "INSERT INTO cargos (area_id, nombre, estado, created_at, updated_at) VALUES (%s,%s,%s,NOW(),NOW())",
+            (area_id, nombre, estado)
+        )
+        nuevo_id = cursor.lastrowid
+        conexion.commit(); cursor.close(); conexion.close()
+        return jsonify({"estado": "ok", "mensaje": "Cargo creado correctamente.", "id": nuevo_id}), 201
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+@app.route("/api/admin/estructura/cargos/<int:cargo_id>", methods=["PUT"])
+@token_requerido
+@roles_permitidos("administrador")
+def actualizar_cargo(cargo_id):
+    data = request.get_json() or {}
+    nombre  = normalizar_espacios(data.get("nombre"))
+    area_id = data.get("area_id")
+    estado  = limpiar_texto(data.get("estado") or "activo")
+    if not nombre or len(nombre) < 2:
+        return jsonify({"estado": "error", "mensaje": "El nombre del cargo es obligatorio."}), 400
+    if not area_id:
+        return jsonify({"estado": "error", "mensaje": "Debe seleccionar un área."}), 400
+    if estado not in ("activo", "inactivo"):
+        estado = "activo"
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute("SELECT id FROM cargos WHERE nombre=%s AND area_id=%s AND id!=%s LIMIT 1", (nombre, area_id, cargo_id))
+        if cursor.fetchone():
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Ya existe ese cargo en el área seleccionada."}), 409
+        cursor.execute(
+            "UPDATE cargos SET nombre=%s, area_id=%s, estado=%s, updated_at=NOW() WHERE id=%s",
+            (nombre, area_id, estado, cargo_id)
+        )
+        if cursor.rowcount == 0:
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Cargo no encontrado."}), 404
+        conexion.commit(); cursor.close(); conexion.close()
+        return jsonify({"estado": "ok", "mensaje": "Cargo actualizado correctamente."}), 200
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+@app.route("/api/admin/estructura/cargos/<int:cargo_id>", methods=["DELETE"])
+@token_requerido
+@roles_permitidos("administrador")
+def eliminar_cargo(cargo_id):
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute("DELETE FROM cargos WHERE id=%s", (cargo_id,))
+        if cursor.rowcount == 0:
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Cargo no encontrado."}), 404
+        conexion.commit(); cursor.close(); conexion.close()
+        return jsonify({"estado": "ok", "mensaje": "Cargo eliminado correctamente."}), 200
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+# =====================================================
+# LIMPIEZA DE DUPLICADOS — áreas y cargos
+# =====================================================
+
+@app.route("/api/admin/estructura/limpiar-duplicados", methods=["POST"])
+@token_requerido
+@roles_permitidos("administrador")
+def limpiar_duplicados_estructura():
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        areas_eliminadas = 0
+        cargos_eliminados = 0
+
+        # — ÁREAS duplicadas (mismo nombre + direccion_id, conserva el de menor id) —
+        cursor.execute("""
+            SELECT nombre, direccion_id, MIN(id) AS id_conservar, COUNT(*) AS total
+            FROM areas
+            GROUP BY nombre, direccion_id
+            HAVING COUNT(*) > 1
+        """)
+        dup_areas = cursor.fetchall()
+
+        for dup in dup_areas:
+            conservar = dup["id_conservar"]
+            nombre    = dup["nombre"]
+            dir_id    = dup["direccion_id"]
+
+            cursor.execute("""
+                SELECT id FROM areas
+                WHERE nombre=%s AND direccion_id=%s AND id != %s
+            """, (nombre, dir_id, conservar))
+            extras = [r["id"] for r in cursor.fetchall()]
+
+            for dup_id in extras:
+                # reasignar referencias antes de borrar
+                cursor.execute("UPDATE area_personal SET area_id=%s WHERE area_id=%s", (conservar, dup_id))
+                cursor.execute("UPDATE cargos      SET area_id=%s WHERE area_id=%s", (conservar, dup_id))
+                cursor.execute("UPDATE solicitudes SET area_id=%s WHERE area_id=%s", (conservar, dup_id))
+                cursor.execute("DELETE FROM areas WHERE id=%s", (dup_id,))
+                areas_eliminadas += 1
+
+        # — CARGOS duplicados (mismo nombre + area_id, conserva el de menor id) —
+        cursor.execute("""
+            SELECT nombre, area_id, MIN(id) AS id_conservar, COUNT(*) AS total
+            FROM cargos
+            GROUP BY nombre, area_id
+            HAVING COUNT(*) > 1
+        """)
+        dup_cargos = cursor.fetchall()
+
+        for dup in dup_cargos:
+            conservar = dup["id_conservar"]
+            nombre    = dup["nombre"]
+            area_id   = dup["area_id"]
+
+            cursor.execute("""
+                SELECT id FROM cargos
+                WHERE nombre=%s AND area_id=%s AND id != %s
+            """, (nombre, area_id, conservar))
+            extras = [r["id"] for r in cursor.fetchall()]
+
+            for dup_id in extras:
+                cursor.execute("DELETE FROM cargos WHERE id=%s", (dup_id,))
+                cargos_eliminados += 1
+
+        conexion.commit()
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": f"Limpieza completada. Áreas eliminadas: {areas_eliminadas}, Cargos eliminados: {cargos_eliminados}.",
+            "areas_eliminadas": areas_eliminadas,
+            "cargos_eliminados": cargos_eliminados
+        }), 200
+
+    except Exception as e:
+        conexion.rollback()
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+# =====================================================
+# CATÁLOGOS — direcciones, áreas y cargos
+# =====================================================
+
+@app.route("/api/admin/catalogo/direcciones", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador")
+def catalogo_direcciones():
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute("SELECT id, nombre FROM direcciones WHERE estado='activo' ORDER BY nombre")
+        datos = cursor.fetchall()
+        cursor.close()
+        conexion.close()
+        return jsonify({"estado": "ok", "direcciones": datos}), 200
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+@app.route("/api/admin/catalogo/areas", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador")
+def catalogo_areas():
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        direccion_id = request.args.get("direccion_id")
+        if direccion_id:
+            cursor.execute(
+                "SELECT id, nombre, direccion_id FROM areas WHERE estado='activo' AND direccion_id=%s ORDER BY nombre",
+                (direccion_id,)
+            )
+        else:
+            cursor.execute("SELECT id, nombre, direccion_id FROM areas WHERE estado='activo' ORDER BY nombre")
+        datos = cursor.fetchall()
+        cursor.close()
+        conexion.close()
+        return jsonify({"estado": "ok", "areas": datos}), 200
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+@app.route("/api/admin/catalogo/cargos", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador")
+def catalogo_cargos():
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        area_id = request.args.get("area_id")
+        if area_id:
+            cursor.execute(
+                "SELECT id, nombre FROM cargos WHERE estado='activo' AND area_id=%s ORDER BY nombre",
+                (area_id,)
+            )
+        else:
+            cursor.execute("SELECT id, nombre, area_id FROM cargos WHERE estado='activo' ORDER BY nombre")
+        datos = cursor.fetchall()
+        cursor.close()
+        conexion.close()
+        return jsonify({"estado": "ok", "cargos": datos}), 200
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+# =====================================================
+# FUNCIONARIOS — CRUD sobre area_personal
+# =====================================================
+
+@app.route("/api/admin/funcionarios", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador")
+def listar_funcionarios():
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        q = limpiar_texto(request.args.get("q") or "")
+        tipo = limpiar_texto(request.args.get("tipo") or "")
+        estado = limpiar_texto(request.args.get("estado") or "")
+
+        sql = """
+            SELECT
+                ap.id,
+                ap.nombres,
+                ap.apellidos,
+                ap.cedula,
+                ap.correo,
+                ap.cargo,
+                ap.tipo_responsable,
+                ap.estado,
+                ap.area_id,
+                a.nombre  AS area_nombre,
+                a.direccion_id,
+                d.nombre  AS direccion_nombre,
+                ap.usuario_id,
+                u.usuario AS usuario_sistema,
+                ap.created_at,
+                ap.updated_at
+            FROM area_personal ap
+            LEFT JOIN areas       a ON a.id  = ap.area_id
+            LEFT JOIN direcciones d ON d.id  = a.direccion_id
+            LEFT JOIN usuarios    u ON u.id  = ap.usuario_id
+            WHERE 1=1
+        """
+        params = []
+
+        if q:
+            sql += """
+                AND (
+                    ap.nombres        LIKE %s OR
+                    ap.apellidos      LIKE %s OR
+                    ap.cedula         LIKE %s OR
+                    ap.correo         LIKE %s OR
+                    ap.cargo          LIKE %s OR
+                    a.nombre          LIKE %s OR
+                    d.nombre          LIKE %s
+                )
+            """
+            like = f"%{q}%"
+            params += [like] * 7
+
+        if tipo:
+            sql += " AND ap.tipo_responsable = %s"
+            params.append(tipo)
+
+        if estado:
+            sql += " AND ap.estado = %s"
+            params.append(estado)
+
+        sql += " ORDER BY d.nombre, a.nombre, ap.apellidos, ap.nombres"
+
+        cursor.execute(sql, params)
+        funcionarios = cursor.fetchall()
+        cursor.close()
+        conexion.close()
+        return jsonify({"estado": "ok", "funcionarios": funcionarios}), 200
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+@app.route("/api/admin/funcionarios", methods=["POST"])
+@token_requerido
+@roles_permitidos("administrador")
+def crear_funcionario():
+    data = request.get_json() or {}
+    nombres    = normalizar_espacios(data.get("nombres"))
+    apellidos  = normalizar_espacios(data.get("apellidos"))
+    cedula     = limpiar_texto(data.get("cedula") or "")
+    correo     = limpiar_texto(data.get("correo") or "").lower()
+    cargo      = normalizar_espacios(data.get("cargo"))
+    tipo       = limpiar_texto(data.get("tipo_responsable") or "funcionario")
+    area_id    = data.get("area_id")
+    estado     = limpiar_texto(data.get("estado") or "activo")
+
+    if not nombres or not apellidos or not cargo or not area_id:
+        return jsonify({"estado": "error", "mensaje": "nombres, apellidos, cargo y área son obligatorios"}), 400
+
+    if estado not in ("activo", "inactivo"):
+        estado = "activo"
+    if tipo not in ("jefe_area", "analista_tics", "funcionario", "responsable_tecnico"):
+        tipo = "funcionario"
+
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute("""
+            INSERT INTO area_personal
+                (area_id, nombres, apellidos, cedula, correo, cargo, tipo_responsable, estado, created_at, updated_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
+        """, (area_id, nombres, apellidos, cedula or None, correo or None, cargo, tipo, estado))
+        nuevo_id = cursor.lastrowid
+        conexion.commit()
+        cursor.close()
+        conexion.close()
+        return jsonify({"estado": "ok", "mensaje": "Funcionario registrado correctamente.", "id": nuevo_id}), 201
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+@app.route("/api/admin/funcionarios/<int:funcionario_id>", methods=["PUT"])
+@token_requerido
+@roles_permitidos("administrador")
+def actualizar_funcionario(funcionario_id):
+    data = request.get_json() or {}
+    nombres    = normalizar_espacios(data.get("nombres"))
+    apellidos  = normalizar_espacios(data.get("apellidos"))
+    cedula     = limpiar_texto(data.get("cedula") or "")
+    correo     = limpiar_texto(data.get("correo") or "").lower()
+    cargo      = normalizar_espacios(data.get("cargo"))
+    tipo       = limpiar_texto(data.get("tipo_responsable") or "funcionario")
+    area_id    = data.get("area_id")
+    estado     = limpiar_texto(data.get("estado") or "activo")
+
+    if not nombres or not apellidos or not cargo or not area_id:
+        return jsonify({"estado": "error", "mensaje": "nombres, apellidos, cargo y área son obligatorios"}), 400
+
+    if estado not in ("activo", "inactivo"):
+        estado = "activo"
+    if tipo not in ("jefe_area", "analista_tics", "funcionario", "responsable_tecnico"):
+        tipo = "funcionario"
+
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute("""
+            UPDATE area_personal
+            SET area_id=%s, nombres=%s, apellidos=%s, cedula=%s, correo=%s,
+                cargo=%s, tipo_responsable=%s, estado=%s, updated_at=NOW()
+            WHERE id=%s
+        """, (area_id, nombres, apellidos, cedula or None, correo or None, cargo, tipo, estado, funcionario_id))
+        if cursor.rowcount == 0:
+            cursor.close()
+            conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Funcionario no encontrado."}), 404
+        conexion.commit()
+        cursor.close()
+        conexion.close()
+        return jsonify({"estado": "ok", "mensaje": "Funcionario actualizado correctamente."}), 200
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+@app.route("/api/admin/funcionarios/<int:funcionario_id>", methods=["DELETE"])
+@token_requerido
+@roles_permitidos("administrador")
+def eliminar_funcionario(funcionario_id):
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute("SELECT id, nombres, apellidos FROM area_personal WHERE id=%s", (funcionario_id,))
+        f = cursor.fetchone()
+        if not f:
+            cursor.close()
+            conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Funcionario no encontrado."}), 404
+        cursor.execute("DELETE FROM area_personal WHERE id=%s", (funcionario_id,))
+        conexion.commit()
+        cursor.close()
+        conexion.close()
+        return jsonify({"estado": "ok", "mensaje": f"Funcionario {f['nombres']} {f['apellidos']} eliminado."}), 200
+    except Exception as e:
+        return jsonify({"estado": "error", "mensaje": str(e)}), 500
+
+
+# =====================================================
+# listado de auditoría
+# =====================================================
+
+@app.route("/api/admin/auditoria", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador")
+def listar_auditoria():
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                a.id,
+                a.usuario_id,
+                a.solicitud_id,
+                u.usuario,
+                u.nombres,
+                u.apellidos,
+                s.codigo_solicitud,
+                a.modulo,
+                a.accion,
+                a.descripcion,
+                a.datos_anteriores,
+                a.datos_nuevos,
+                a.ip_origen,
+                a.user_agent,
+                a.created_at
+            from auditoria a
+            left join usuarios u on u.id = a.usuario_id
+            left join solicitudes s on s.id = a.solicitud_id
+            order by a.created_at desc, a.id desc
+            limit 500;
+        """)
+
+        registros = cursor.fetchall()
+
+        for registro in registros:
+            registro["created_at"] = serializar_fecha(registro["created_at"])
+
+            if registro.get("datos_anteriores") is None:
+                registro["datos_anteriores"] = None
+
+            if registro.get("datos_nuevos") is None:
+                registro["datos_nuevos"] = None
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "auditoría obtenida correctamente.",
+            "total": len(registros),
+            "auditoria": registros
+        }), 200
+
+    except Error as error:
+        try:
+            cursor.close()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al obtener la auditoría.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        try:
+            cursor.close()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al obtener la auditoría.",
+            "error": str(error)
+        }), 500
+    
+    # =====================================================
+# listado de usuarios
+# =====================================================
+
+@app.route("/api/admin/usuarios", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador")
+def listar_usuarios_admin():
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                u.id,
+                u.nombres,
+                u.apellidos,
+                u.cedula,
+                u.correo,
+                u.usuario,
+                r.nombre as rol,
+                u.cargo,
+                u.area_unidad,
+                u.dependencia,
+                u.telefono_ext,
+                u.estado,
+                u.ultimo_acceso,
+                u.created_at,
+                u.updated_at
+            from usuarios u
+            inner join roles r on r.id = u.rol_id
+            order by u.id desc;
+        """)
+
+        usuarios = cursor.fetchall()
+
+        for usuario in usuarios:
+            usuario["ultimo_acceso"] = serializar_fecha(usuario["ultimo_acceso"])
+            usuario["created_at"] = serializar_fecha(usuario["created_at"])
+            usuario["updated_at"] = serializar_fecha(usuario["updated_at"])
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "usuarios obtenidos correctamente.",
+            "total": len(usuarios),
+            "usuarios": usuarios
+        }), 200
+
+    except Error as error:
+        try:
+            cursor.close()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al obtener los usuarios.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        try:
+            cursor.close()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al obtener los usuarios.",
+            "error": str(error)
+        }), 500
+    # =====================================================
+# crear usuario
+# =====================================================
+
+@app.route("/api/admin/usuarios", methods=["POST"])
+@token_requerido
+@roles_permitidos("administrador")
+def crear_usuario_admin():
+    usuario_actual = request.usuario_actual
+    data = request.get_json() or {}
+
+    nombres = normalizar_espacios(data.get("nombres"))
+    apellidos = normalizar_espacios(data.get("apellidos"))
+    cedula = limpiar_texto(data.get("cedula"))
+    correo = limpiar_texto(data.get("correo")).lower()
+    usuario = limpiar_texto(data.get("usuario")).lower()
+    password = limpiar_texto(data.get("password"))
+    rol = limpiar_texto(data.get("rol"))
+    cargo = normalizar_espacios(data.get("cargo"))
+    area_unidad = normalizar_espacios(data.get("area_unidad"))
+    dependencia = normalizar_espacios(data.get("dependencia"))
+    telefono_ext = limpiar_texto(data.get("telefono_ext"))
+    estado = limpiar_texto(data.get("estado")) or "activo"
+
+    errores = {}
+
+    if not nombres:
+        errores["nombres"] = "los nombres son obligatorios."
+
+    if not apellidos:
+        errores["apellidos"] = "los apellidos son obligatorios."
+
+    if not re.match(r"^\d{10}$", cedula):
+        errores["cedula"] = "la cédula debe tener exactamente 10 números."
+
+    if not re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", correo):
+        errores["correo"] = "ingrese un correo válido."
+
+    if not usuario:
+        errores["usuario"] = "el usuario es obligatorio."
+
+    if not password or len(password) < 6:
+        errores["password"] = "la contraseña debe tener mínimo 6 caracteres."
+
+    if rol not in ["administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics"]:
+        errores["rol"] = "rol no válido."
+
+    if estado not in ["activo", "inactivo"]:
+        errores["estado"] = "estado no válido."
+
+    if not cargo:
+        errores["cargo"] = "el cargo es obligatorio."
+
+    if not area_unidad:
+        errores["area_unidad"] = "el área o unidad es obligatoria."
+
+    if not dependencia:
+        errores["dependencia"] = "la dependencia es obligatoria."
+
+    if errores:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "existen errores de validación.",
+            "errores": errores
+        }), 400
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select id
+            from roles
+            where nombre = %s
+              and estado = 'activo'
+            limit 1;
+        """, (rol,))
+
+        rol_encontrado = cursor.fetchone()
+
+        if rol_encontrado is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "el rol seleccionado no existe o está inactivo."
+            }), 400
+
+        cursor.execute("""
+            select id
+            from usuarios
+            where cedula = %s
+               or correo = %s
+               or usuario = %s
+            limit 1;
+        """, (cedula, correo, usuario))
+
+        duplicado = cursor.fetchone()
+
+        if duplicado:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "ya existe un usuario con la misma cédula, correo o nombre de usuario."
+            }), 409
+
+        password_hash = bcrypt.hashpw(
+            password.encode("utf-8"),
+            bcrypt.gensalt()
+        ).decode("utf-8")
+
+        cursor.execute("""
+            insert into usuarios (
+                rol_id,
+                nombres,
+                apellidos,
+                cedula,
+                correo,
+                usuario,
+                password_hash,
+                cargo,
+                area_unidad,
+                dependencia,
+                telefono_ext,
+                estado
+            ) values (
+                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
+            );
+        """, (
+            rol_encontrado["id"],
+            nombres,
+            apellidos,
+            cedula,
+            correo,
+            usuario,
+            password_hash,
+            cargo,
+            area_unidad,
+            dependencia,
+            telefono_ext,
+            estado
+        ))
+
+        usuario_id = cursor.lastrowid
+
+        cursor.execute("""
+            insert into auditoria (
+                usuario_id,
+                solicitud_id,
+                modulo,
+                accion,
+                descripcion,
+                datos_anteriores,
+                datos_nuevos,
+                ip_origen,
+                user_agent
+            ) values (
+                %s, null, 'usuarios', 'crear', %s, null, %s, %s, %s
+            );
+        """, (
+            usuario_actual["id"],
+            f"usuario creado: {usuario}",
+            json.dumps({
+                "id": usuario_id,
+                "usuario": usuario,
+                "rol": rol,
+                "estado": estado
+            }, ensure_ascii=False),
+            request.remote_addr,
+            request.headers.get("User-Agent")
+        ))
+
+        conexion.commit()
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "usuario registrado correctamente.",
+            "usuario": {
+                "id": usuario_id,
+                "nombres": nombres,
+                "apellidos": apellidos,
+                "cedula": cedula,
+                "correo": correo,
+                "usuario": usuario,
+                "rol": rol,
+                "cargo": cargo,
+                "area_unidad": area_unidad,
+                "dependencia": dependencia,
+                "telefono_ext": telefono_ext,
+                "estado": estado
+            }
+        }), 201
+
+    except Error as error:
+        try:
+            conexion.rollback()
+            cursor.close()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al registrar el usuario.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        try:
+            conexion.rollback()
+            cursor.close()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al registrar el usuario.",
+            "error": str(error)
+        }), 500
+
+
+# =====================================================
+# actualizar usuario
+# =====================================================
+
+@app.route("/api/admin/usuarios/<int:usuario_id>", methods=["PUT"])
+@token_requerido
+@roles_permitidos("administrador")
+def actualizar_usuario_admin(usuario_id):
+    usuario_actual = request.usuario_actual
+    data = request.get_json() or {}
+
+    nombres = normalizar_espacios(data.get("nombres"))
+    apellidos = normalizar_espacios(data.get("apellidos"))
+    cedula = limpiar_texto(data.get("cedula"))
+    correo = limpiar_texto(data.get("correo")).lower()
+    usuario = limpiar_texto(data.get("usuario")).lower()
+    password = limpiar_texto(data.get("password"))
+    rol = limpiar_texto(data.get("rol"))
+    cargo = normalizar_espacios(data.get("cargo"))
+    area_unidad = normalizar_espacios(data.get("area_unidad"))
+    dependencia = normalizar_espacios(data.get("dependencia"))
+    telefono_ext = limpiar_texto(data.get("telefono_ext"))
+    estado = limpiar_texto(data.get("estado")) or "activo"
+
+    errores = {}
+
+    if not nombres:
+        errores["nombres"] = "los nombres son obligatorios."
+
+    if not apellidos:
+        errores["apellidos"] = "los apellidos son obligatorios."
+
+    if not re.match(r"^\d{10}$", cedula):
+        errores["cedula"] = "la cédula debe tener exactamente 10 números."
+
+    if not re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", correo):
+        errores["correo"] = "ingrese un correo válido."
+
+    if not usuario:
+        errores["usuario"] = "el usuario es obligatorio."
+
+    if password and len(password) < 6:
+        errores["password"] = "la contraseña debe tener mínimo 6 caracteres."
+
+    if rol not in ["administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics"]:
+        errores["rol"] = "rol no válido."
+
+    if estado not in ["activo", "inactivo"]:
+        errores["estado"] = "estado no válido."
+
+    if not cargo:
+        errores["cargo"] = "el cargo es obligatorio."
+
+    if not area_unidad:
+        errores["area_unidad"] = "el área o unidad es obligatoria."
+
+    if not dependencia:
+        errores["dependencia"] = "la dependencia es obligatoria."
+
+    if errores:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "existen errores de validación.",
+            "errores": errores
+        }), 400
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                u.id,
+                u.rol_id,
+                r.nombre as rol,
+                u.nombres,
+                u.apellidos,
+                u.cedula,
+                u.correo,
+                u.usuario,
+                u.cargo,
+                u.area_unidad,
+                u.dependencia,
+                u.telefono_ext,
+                u.estado
+            from usuarios u
+            inner join roles r on r.id = u.rol_id
+            where u.id = %s
+            limit 1;
+        """, (usuario_id,))
+
+        usuario_anterior = cursor.fetchone()
+
+        if usuario_anterior is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "usuario no encontrado."
+            }), 404
+
+        cursor.execute("""
+            select id
+            from roles
+            where nombre = %s
+              and estado = 'activo'
+            limit 1;
+        """, (rol,))
+
+        rol_encontrado = cursor.fetchone()
+
+        if rol_encontrado is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "el rol seleccionado no existe o está inactivo."
+            }), 400
+
+        cursor.execute("""
+            select id
+            from usuarios
+            where id <> %s
+              and (
+                cedula = %s
+                or correo = %s
+                or usuario = %s
+              )
+            limit 1;
+        """, (usuario_id, cedula, correo, usuario))
+
+        duplicado = cursor.fetchone()
+
+        if duplicado:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "ya existe otro usuario con la misma cédula, correo o nombre de usuario."
+            }), 409
+
+        if password:
+            password_hash = bcrypt.hashpw(
+                password.encode("utf-8"),
+                bcrypt.gensalt()
+            ).decode("utf-8")
+
+            cursor.execute("""
+                update usuarios
+                set
+                    rol_id = %s,
+                    nombres = %s,
+                    apellidos = %s,
+                    cedula = %s,
+                    correo = %s,
+                    usuario = %s,
+                    password_hash = %s,
+                    cargo = %s,
+                    area_unidad = %s,
+                    dependencia = %s,
+                    telefono_ext = %s,
+                    estado = %s
+                where id = %s;
+            """, (
+                rol_encontrado["id"],
+                nombres,
+                apellidos,
+                cedula,
+                correo,
+                usuario,
+                password_hash,
+                cargo,
+                area_unidad,
+                dependencia,
+                telefono_ext,
+                estado,
+                usuario_id
+            ))
+        else:
+            cursor.execute("""
+                update usuarios
+                set
+                    rol_id = %s,
+                    nombres = %s,
+                    apellidos = %s,
+                    cedula = %s,
+                    correo = %s,
+                    usuario = %s,
+                    cargo = %s,
+                    area_unidad = %s,
+                    dependencia = %s,
+                    telefono_ext = %s,
+                    estado = %s
+                where id = %s;
+            """, (
+                rol_encontrado["id"],
+                nombres,
+                apellidos,
+                cedula,
+                correo,
+                usuario,
+                cargo,
+                area_unidad,
+                dependencia,
+                telefono_ext,
+                estado,
+                usuario_id
+            ))
+
+        datos_nuevos = {
+            "id": usuario_id,
+            "nombres": nombres,
+            "apellidos": apellidos,
+            "cedula": cedula,
+            "correo": correo,
+            "usuario": usuario,
+            "rol": rol,
+            "cargo": cargo,
+            "area_unidad": area_unidad,
+            "dependencia": dependencia,
+            "telefono_ext": telefono_ext,
+            "estado": estado,
+            "password_actualizada": bool(password)
+        }
+
+        cursor.execute("""
+            insert into auditoria (
+                usuario_id,
+                solicitud_id,
+                modulo,
+                accion,
+                descripcion,
+                datos_anteriores,
+                datos_nuevos,
+                ip_origen,
+                user_agent
+            ) values (
+                %s, null, 'usuarios', 'actualizar', %s, %s, %s, %s, %s
+            );
+        """, (
+            usuario_actual["id"],
+            f"usuario actualizado: {usuario}",
+            json.dumps(usuario_anterior, ensure_ascii=False, default=str),
+            json.dumps(datos_nuevos, ensure_ascii=False),
+            request.remote_addr,
+            request.headers.get("User-Agent")
+        ))
+
+        conexion.commit()
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "usuario actualizado correctamente.",
+            "usuario": datos_nuevos
+        }), 200
+
+    except Error as error:
+        try:
+            conexion.rollback()
+            cursor.close()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al actualizar el usuario.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        try:
+            conexion.rollback()
+            cursor.close()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al actualizar el usuario.",
+            "error": str(error)
+        }), 500
+
+
+# =====================================================
+# cambiar estado de usuario
+# =====================================================
+
+@app.route("/api/admin/usuarios/<int:usuario_id>/estado", methods=["PUT"])
+@token_requerido
+@roles_permitidos("administrador")
+def cambiar_estado_usuario_admin(usuario_id):
+    usuario_actual = request.usuario_actual
+    data = request.get_json() or {}
+
+    nuevo_estado = limpiar_texto(data.get("estado"))
+
+    if nuevo_estado not in ["activo", "inactivo"]:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "estado no válido."
+        }), 400
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                id,
+                usuario,
+                nombres,
+                apellidos,
+                estado
+            from usuarios
+            where id = %s
+            limit 1;
+        """, (usuario_id,))
+
+        usuario_encontrado = cursor.fetchone()
+
+        if usuario_encontrado is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "usuario no encontrado."
+            }), 404
+
+        if usuario_encontrado["id"] == usuario_actual["id"] and nuevo_estado == "inactivo":
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no puede desactivar su propio usuario."
+            }), 409
+
+        cursor.execute("""
+            update usuarios
+            set estado = %s
+            where id = %s;
+        """, (nuevo_estado, usuario_id))
+
+        cursor.execute("""
+            insert into auditoria (
+                usuario_id,
+                solicitud_id,
+                modulo,
+                accion,
+                descripcion,
+                datos_anteriores,
+                datos_nuevos,
+                ip_origen,
+                user_agent
+            ) values (
+                %s, null, 'usuarios', 'cambiar_estado', %s, %s, %s, %s, %s
+            );
+        """, (
+            usuario_actual["id"],
+            f"estado de usuario cambiado: {usuario_encontrado['usuario']} -> {nuevo_estado}",
+            json.dumps(usuario_encontrado, ensure_ascii=False, default=str),
+            json.dumps({
+                "id": usuario_id,
+                "usuario": usuario_encontrado["usuario"],
+                "estado": nuevo_estado
+            }, ensure_ascii=False),
+            request.remote_addr,
+            request.headers.get("User-Agent")
+        ))
+
+        conexion.commit()
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "estado del usuario actualizado correctamente.",
+            "usuario": {
+                "id": usuario_id,
+                "estado": nuevo_estado
+            }
+        }), 200
+
+    except Error as error:
+        try:
+            conexion.rollback()
+            cursor.close()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al cambiar el estado del usuario.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        try:
+            conexion.rollback()
+            cursor.close()
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al cambiar el estado del usuario.",
+            "error": str(error)
+        }), 500
+    
+
+# =====================================================
+# catálogos públicos: direcciones, áreas, cargos y jefe
+# =====================================================
+
+@app.route("/api/public/catalogos/direcciones", methods=["GET"])
+def listar_direcciones_publicas():
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                id,
+                nombre,
+                descripcion,
+                estado
+            from direcciones
+            where estado = 'activo'
+            order by nombre asc;
+        """)
+
+        direcciones = cursor.fetchall()
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "direcciones obtenidas correctamente.",
+            "total": len(direcciones),
+            "direcciones": direcciones
+        }), 200
+
+    except Error as error:
+        try:
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al obtener las direcciones.",
+            "error": str(error)
+        }), 500
+
+
+@app.route("/api/public/catalogos/direcciones/<int:direccion_id>/areas", methods=["GET"])
+def listar_areas_por_direccion_publica(direccion_id):
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                id,
+                direccion_id,
+                nombre,
+                siglas,
+                descripcion,
+                estado
+            from areas
+            where direccion_id = %s
+              and estado = 'activo'
+            order by nombre asc;
+        """, (direccion_id,))
+
+        areas = cursor.fetchall()
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "áreas obtenidas correctamente.",
+            "direccion_id": direccion_id,
+            "total": len(areas),
+            "areas": areas
+        }), 200
+
+    except Error as error:
+        try:
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al obtener las áreas de la dirección.",
+            "error": str(error)
+        }), 500
+
+
+@app.route("/api/public/catalogos/areas/<int:area_id>/cargos", methods=["GET"])
+def listar_cargos_por_area_publica(area_id):
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                id,
+                area_id,
+                nombre,
+                descripcion,
+                estado
+            from cargos
+            where area_id = %s
+              and estado = 'activo'
+            order by nombre asc;
+        """, (area_id,))
+
+        cargos = cursor.fetchall()
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "cargos obtenidos correctamente.",
+            "area_id": area_id,
+            "total": len(cargos),
+            "cargos": cargos
+        }), 200
+
+    except Error as error:
+        try:
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al obtener los cargos del área.",
+            "error": str(error)
+        }), 500
+
+
+@app.route("/api/public/catalogos/areas/<int:area_id>/jefe", methods=["GET"])
+def obtener_jefe_por_area_publica(area_id):
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                id,
+                area_id,
+                usuario_id,
+                nombres,
+                apellidos,
+                correo,
+                cargo,
+                tipo_responsable,
+                estado
+            from area_personal
+            where area_id = %s
+              and tipo_responsable = 'jefe_area'
+              and estado = 'activo'
+            order by id asc
+            limit 1;
+        """, (area_id,))
+
+        jefe = cursor.fetchone()
+
+        cursor.close()
+        conexion.close()
+
+        if jefe is None:
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no existe un jefe asignado para esta área.",
+                "area_id": area_id,
+                "jefe": None
+            }), 404
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "jefe asignado obtenido correctamente.",
+            "area_id": area_id,
+            "jefe": jefe
+        }), 200
+
+    except Error as error:
+        try:
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al obtener el jefe asignado del área.",
+            "error": str(error)
+        }), 500
+        
+@app.route("/api/public/electronico/<codigo_solicitud>/pdf", methods=["GET"])
+def descargar_pdf_publico_firmaec(codigo_solicitud):
+    codigo_solicitud = limpiar_texto(codigo_solicitud).upper()
+
+    if not codigo_solicitud:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el código de solicitud es obligatorio."
+        }), 400
+
+    if not re.match(r"^INAMHI-WEB-\d{4}-\d{4}$", codigo_solicitud):
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el código de solicitud no tiene un formato válido."
+        }), 400
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            select
+                s.id,
+                s.direccion_id,
+                s.area_id,
+                s.cargo_id,
+                s.jefe_asignado_id,
+                s.maxima_autoridad_id,
+                s.codigo_solicitud,
+                s.nombres_completos,
+                s.cedula,
+                s.correo_institucional,
+                s.telefono_ext,
+                s.dependencia,
+                s.area_unidad,
+                s.cargo,
+                s.fecha_solicitud,
+                s.tipo_usuario,
+                s.nombre_usuario_externo,
+                s.direccion_ip,
+                s.tiempo_vigencia_acceso,
+                s.justificacion_necesidad_institucional,
+                s.estado,
+                s.etapa_actual,
+                s.bloqueada,
+                s.created_at,
+                s.updated_at,
+
+                (
+                    select concat(p.nombres, ' ', ifnull(p.apellidos, ''))
+                    from area_personal p
+                    where p.area_id = s.area_id
+                      and p.tipo_responsable = 'jefe_area'
+                      and p.estado = 'activo'
+                    order by p.id asc
+                    limit 1
+                ) as nombre_jefe_area,
+
+                (
+                    select concat(u.nombres, ' ', ifnull(u.apellidos, ''))
+                    from usuarios u
+                    inner join roles r on r.id = u.rol_id
+                    where r.nombre = 'maxima_autoridad'
+                      and u.estado = 'activo'
+                    order by u.id asc
+                    limit 1
+                ) as nombre_maxima_autoridad,
+
+                (
+                    select concat(u.nombres, ' ', ifnull(u.apellidos, ''))
+                    from usuarios u
+                    inner join roles r on r.id = u.rol_id
+                    where r.nombre = 'analista_tics'
+                      and u.estado = 'activo'
+                    order by u.id asc
+                    limit 1
+                ) as nombre_encargado_tics
+
+            from solicitudes s
+            where s.codigo_solicitud = %s
+            limit 1;
+        """, (codigo_solicitud,))
+
+        solicitud = cursor.fetchone()
+
+        if solicitud is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no se encontró una solicitud con ese código."
+            }), 404
+
+        cursor.execute("""
+            select
+                numero,
+                url_pagina,
+                descripcion
+            from solicitud_paginas_web
+            where solicitud_id = %s
+            order by numero asc;
+        """, (solicitud["id"],))
+
+        paginas_web = cursor.fetchall()
+
+        cursor.close()
+        conexion.close()
+
+        solicitud["modo_pdf"] = "electronico"
+
+        pdf_buffer = generar_pdf_solicitud_a4(
+            solicitud,
+            paginas_web,
+            incluir_seccion_tics=False,
+            modo_pdf="electronico"
+        )
+
+        respuesta = send_file(
+            pdf_buffer,
+            mimetype="application/pdf",
+            as_attachment=True,
+            download_name=f"{codigo_solicitud}.pdf",
+            max_age=0
+        )
+
+        respuesta.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        respuesta.headers["Pragma"] = "no-cache"
+        respuesta.headers["Expires"] = "0"
+
+        return respuesta
+
+    except Error as error:
+        print("ERROR MYSQL AL DESCARGAR PDF FIRMAEC:", error)
+
+        try:
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al descargar el formato PDF.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        print("ERROR GENERAL AL GENERAR PDF FIRMAEC:", error)
+
+        try:
+            conexion.close()
+        except Exception:
+            pass
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al generar el PDF para FirmaEC.",
+            "error": str(error)
+        }), 500
+    # =====================================================
+# ruta temporal para crear jefes ficticios por área
+# eliminar o comentar después de usar
+# =====================================================
+
+@app.route("/api/dev/crear-jefes-ficticios", methods=["GET"])
+def crear_jefes_ficticios():
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        # =====================================================
+        # obtener rol jefe_inmediato
+        # =====================================================
+
+        cursor.execute("""
+            select id
+            from roles
+            where nombre = 'jefe_inmediato'
+            limit 1;
+        """)
+
+        rol_jefe = cursor.fetchone()
+
+        if rol_jefe is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no existe el rol jefe_inmediato en la tabla roles."
+            }), 400
+
+        rol_jefe_id = rol_jefe["id"]
+
+        password_temporal = "jefe123"
+        password_hash = crear_hash_password(password_temporal)
+
+        jefes = [
+            {
+                "area_siglas": "TICS",
+                "area_nombre": "TECNOLOGÍAS DE LA INFORMACIÓN Y COMUNICACIÓN",
+                "usuario": "diego.tics",
+                "nombres": "Diego",
+                "apellidos": "Ficticio",
+                "cedula": "0100000001",
+                "correo": "diego.tics@inamhi.gob.ec",
+                "cargo": "Jefe de Tecnologías de la Información y Comunicación",
+                "dependencia": "DIRECCIÓN ADMINISTRATIVA FINANCIERA"
+            },
+            {
+                "area_siglas": "CONT",
+                "area_nombre": "CONTABILIDAD",
+                "usuario": "carlos.conta",
+                "nombres": "Carlos",
+                "apellidos": "Contabilidad",
+                "cedula": "0100000002",
+                "correo": "carlos.contabilidad@inamhi.gob.ec",
+                "cargo": "Jefe de Contabilidad",
+                "dependencia": "DIRECCIÓN ADMINISTRATIVA FINANCIERA"
+            },
+            {
+                "area_siglas": "TES",
+                "area_nombre": "TESORERÍA",
+                "usuario": "ana.tesoreria",
+                "nombres": "Ana",
+                "apellidos": "Tesorería",
+                "cedula": "0100000003",
+                "correo": "ana.tesoreria@inamhi.gob.ec",
+                "cargo": "Jefe de Tesorería",
+                "dependencia": "DIRECCIÓN ADMINISTRATIVA FINANCIERA"
+            },
+            {
+                "area_siglas": "CP",
+                "area_nombre": "COMPRAS PÚBLICAS",
+                "usuario": "luis.compras",
+                "nombres": "Luis",
+                "apellidos": "Compras",
+                "cedula": "0100000004",
+                "correo": "luis.compras@inamhi.gob.ec",
+                "cargo": "Jefe de Compras Públicas",
+                "dependencia": "DIRECCIÓN ADMINISTRATIVA FINANCIERA"
+            }
+        ]
+
+        usuarios_creados = []
+        usuarios_actualizados = []
+        areas_sin_encontrar = []
+
+        for jefe in jefes:
+            # =====================================================
+            # buscar área
+            # =====================================================
+
+            cursor.execute("""
+                select id, nombre, siglas
+                from areas
+                where siglas = %s
+                   or nombre = %s
+                limit 1;
+            """, (
+                jefe["area_siglas"],
+                jefe["area_nombre"]
+            ))
+
+            area = cursor.fetchone()
+
+            if area is None:
+                areas_sin_encontrar.append(jefe["area_nombre"])
+                continue
+
+            area_id = area["id"]
+
+            # =====================================================
+            # crear o actualizar usuario
+            # =====================================================
+
+            cursor.execute("""
+                select id
+                from usuarios
+                where usuario = %s
+                   or correo = %s
+                   or cedula = %s
+                limit 1;
+            """, (
+                jefe["usuario"],
+                jefe["correo"],
+                jefe["cedula"]
+            ))
+
+            usuario_existente = cursor.fetchone()
+
+            if usuario_existente:
+                usuario_id = usuario_existente["id"]
+
+                cursor.execute("""
+                    update usuarios
+                    set
+                        rol_id = %s,
+                        nombres = %s,
+                        apellidos = %s,
+                        cedula = %s,
+                        correo = %s,
+                        usuario = %s,
+                        password_hash = %s,
+                        cargo = %s,
+                        area_unidad = %s,
+                        dependencia = %s,
+                        telefono_ext = %s,
+                        estado = 'activo',
+                        updated_at = now()
+                    where id = %s;
+                """, (
+                    rol_jefe_id,
+                    jefe["nombres"],
+                    jefe["apellidos"],
+                    jefe["cedula"],
+                    jefe["correo"],
+                    jefe["usuario"],
+                    password_hash,
+                    jefe["cargo"],
+                    area["nombre"],
+                    jefe["dependencia"],
+                    "0999999999",
+                    usuario_id
+                ))
+
+                usuarios_actualizados.append(jefe["usuario"])
+
+            else:
+                cursor.execute("""
+                    insert into usuarios (
+                        rol_id,
+                        nombres,
+                        apellidos,
+                        cedula,
+                        correo,
+                        usuario,
+                        password_hash,
+                        cargo,
+                        area_unidad,
+                        dependencia,
+                        telefono_ext,
+                        estado,
+                        created_at,
+                        updated_at
+                    ) values (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        'activo',
+                        now(),
+                        now()
+                    );
+                """, (
+                    rol_jefe_id,
+                    jefe["nombres"],
+                    jefe["apellidos"],
+                    jefe["cedula"],
+                    jefe["correo"],
+                    jefe["usuario"],
+                    password_hash,
+                    jefe["cargo"],
+                    area["nombre"],
+                    jefe["dependencia"],
+                    "0999999999"
+                ))
+
+                usuario_id = cursor.lastrowid
+                usuarios_creados.append(jefe["usuario"])
+
+            # =====================================================
+            # crear o actualizar jefe de área en area_personal
+            # =====================================================
+
+            cursor.execute("""
+                select id
+                from area_personal
+                where area_id = %s
+                  and tipo_responsable = 'jefe_area'
+                limit 1;
+            """, (area_id,))
+
+            jefe_area_existente = cursor.fetchone()
+
+            if jefe_area_existente:
+                cursor.execute("""
+                    update area_personal
+                    set
+                        usuario_id = %s,
+                        nombres = %s,
+                        apellidos = %s,
+                        correo = %s,
+                        cargo = %s,
+                        estado = 'activo',
+                        updated_at = now()
+                    where id = %s;
+                """, (
+                    usuario_id,
+                    jefe["nombres"],
+                    jefe["apellidos"],
+                    jefe["correo"],
+                    jefe["cargo"],
+                    jefe_area_existente["id"]
+                ))
+
+            else:
+                cursor.execute("""
+                    insert into area_personal (
+                        area_id,
+                        usuario_id,
+                        nombres,
+                        apellidos,
+                        correo,
+                        cargo,
+                        tipo_responsable,
+                        estado,
+                        created_at,
+                        updated_at
+                    ) values (
+                        %s, %s, %s, %s, %s, %s,
+                        'jefe_area',
+                        'activo',
+                        now(),
+                        now()
+                    );
+                """, (
+                    area_id,
+                    usuario_id,
+                    jefe["nombres"],
+                    jefe["apellidos"],
+                    jefe["correo"],
+                    jefe["cargo"]
+                ))
+
+        conexion.commit()
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "jefes ficticios creados o actualizados correctamente.",
+            "password_temporal": password_temporal,
+            "usuarios_creados": usuarios_creados,
+            "usuarios_actualizados": usuarios_actualizados,
+            "areas_sin_encontrar": areas_sin_encontrar,
+            "credenciales": [
+                {
+                    "usuario": "diego.tics",
+                    "password": password_temporal,
+                    "area": "TICS"
+                },
+                {
+                    "usuario": "carlos.conta",
+                    "password": password_temporal,
+                    "area": "CONTABILIDAD"
+                },
+                {
+                    "usuario": "ana.tesoreria",
+                    "password": password_temporal,
+                    "area": "TESORERÍA"
+                },
+                {
+                    "usuario": "luis.compras",
+                    "password": password_temporal,
+                    "area": "COMPRAS PÚBLICAS"
+                }
+            ],
+            "advertencia": "esta ruta es temporal. después de usarla, se recomienda comentarla o eliminarla."
+        }), 200
+
+    except Error as error:
+        try:
+            conexion.rollback()
+            conexion.close()
+        except Exception:
+            pass
+
+        print("ERROR AL CREAR JEFES FICTICIOS:", error)
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al crear jefes ficticios.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        try:
+            conexion.rollback()
+            conexion.close()
+        except Exception:
+            pass
+
+        print("ERROR GENERAL AL CREAR JEFES FICTICIOS:", error)
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al crear jefes ficticios.",
+            "error": str(error)
+        }), 500
+
+
+        # =====================================================
+# flujo electrónico público - subir PDF firmado por solicitante
+# =====================================================
+
+@app.route("/api/public/electronico/<codigo_solicitud>/subir-firmado", methods=["POST", "OPTIONS"])
+def subir_pdf_firmado_publico_firmaec(codigo_solicitud):
+    """
+    Recibe el PDF firmado electrónicamente por el solicitante.
+    Luego envía la solicitud al jefe inmediato asignado al área.
+    """
+
+    if request.method == "OPTIONS":
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "preflight correcto."
+        }), 200
+
+    codigo_solicitud = limpiar_texto(codigo_solicitud).upper()
+
+    if not codigo_solicitud:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el código de solicitud es obligatorio."
+        }), 400
+
+    if not re.match(r"^INAMHI-WEB-\d{4}-\d{4}$", codigo_solicitud):
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el código de solicitud no tiene un formato válido."
+        }), 400
+
+    if "archivo" not in request.files:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se recibió ningún archivo PDF firmado."
+        }), 400
+
+    archivo = request.files["archivo"]
+
+    if archivo.filename == "":
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el archivo seleccionado no es válido."
+        }), 400
+
+    nombre_original = secure_filename(archivo.filename)
+    extension = os.path.splitext(nombre_original)[1].lower()
+
+    if extension != ".pdf":
+        return jsonify({
+            "estado": "error",
+            "mensaje": "solo se permite subir archivos PDF."
+        }), 400
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        # =====================================================
+        # buscar solicitud
+        # =====================================================
+
+        cursor.execute("""
+            select
+                id,
+                codigo_solicitud,
+                nombres_completos,
+                correo_institucional,
+                estado,
+                etapa_actual,
+                jefe_asignado_id,
+                area_id
+            from solicitudes
+            where codigo_solicitud = %s
+            limit 1;
+        """, (codigo_solicitud,))
+
+        solicitud = cursor.fetchone()
+
+        if solicitud is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no se encontró una solicitud con ese código."
+            }), 404
+
+        # =====================================================
+        # validar estado actual
+        # =====================================================
+
+        if solicitud["estado"] != "pendiente_firma_solicitante":
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "la solicitud no está pendiente de firma del solicitante.",
+                "estado_actual": solicitud["estado"],
+                "etapa_actual": solicitud["etapa_actual"]
+            }), 400
+
+        # =====================================================
+        # validar jefe asignado
+        # si no tiene jefe_asignado_id, intentar obtenerlo desde area_personal
+        # =====================================================
+
+        jefe_asignado_id = solicitud.get("jefe_asignado_id")
+
+        if not jefe_asignado_id:
+            cursor.execute("""
+                select usuario_id
+                from area_personal
+                where area_id = %s
+                  and tipo_responsable = 'jefe_area'
+                  and estado = 'activo'
+                  and usuario_id is not null
+                order by id asc
+                limit 1;
+            """, (solicitud["area_id"],))
+
+            jefe_area = cursor.fetchone()
+
+            if jefe_area is None or not jefe_area.get("usuario_id"):
+                cursor.close()
+                conexion.close()
+
+                return jsonify({
+                    "estado": "error",
+                    "mensaje": "no existe un usuario jefe asignado para el área de esta solicitud."
+                }), 400
+
+            jefe_asignado_id = jefe_area["usuario_id"]
+
+            cursor.execute("""
+                update solicitudes
+                set
+                    jefe_asignado_id = %s,
+                    updated_at = now()
+                where id = %s;
+            """, (
+                jefe_asignado_id,
+                solicitud["id"]
+            ))
+
+        # =====================================================
+        # guardar archivo firmado
+        # =====================================================
+
+        nombre_archivo = f"{codigo_solicitud}_firmado_solicitante_{uuid.uuid4().hex[:8]}.pdf"
+        ruta_absoluta = os.path.join(FIRMADOS_FOLDER, nombre_archivo)
+
+        archivo.save(ruta_absoluta)
+
+        ruta_relativa = os.path.join("uploads", "firmados", nombre_archivo).replace("\\", "/")
+
+        # =====================================================
+        # registrar documento
+        # =====================================================
+
+        cursor.execute("""
+            insert into solicitud_documentos (
+                solicitud_id,
+                etapa,
+                rol_firmante,
+                usuario_id,
+                tipo_documento,
+                nombre_archivo,
+                ruta_archivo,
+                mime_type,
+                firmado,
+                firma_validada,
+                created_at,
+                updated_at
+            ) values (
+                %s,
+                'firma_solicitante',
+                'solicitante',
+                null,
+                'pdf_firmado_electronico',
+                %s,
+                %s,
+                'application/pdf',
+                true,
+                false,
+                now(),
+                now()
+            );
+        """, (
+            solicitud["id"],
+            nombre_archivo,
+            ruta_relativa
+        ))
+
+        # =====================================================
+        # enviar al jefe inmediato asignado
+        # =====================================================
+
+        cursor.execute("""
+            update solicitudes
+            set
+                estado = 'pendiente_jefe_inmediato',
+                etapa_actual = 'jefe_inmediato',
+                jefe_asignado_id = %s,
+                updated_at = now()
+            where id = %s;
+        """, (
+            jefe_asignado_id,
+            solicitud["id"]
+        ))
+
+        conexion.commit()
+
+        cursor.close()
+        conexion.close()
+
+        try:
+            registrar_auditoria(
+                usuario_id=None,
+                solicitud_id=solicitud["id"],
+                modulo="firmaec_publico",
+                accion="subir_pdf_firmado_solicitante",
+                descripcion=f"PDF firmado electrónicamente subido por el solicitante. Solicitud enviada al jefe asignado. Código {codigo_solicitud}.",
+                datos_anteriores={
+                    "estado": "pendiente_firma_solicitante",
+                    "etapa_actual": "firma_solicitante"
+                },
+                datos_nuevos={
+                    "estado": "pendiente_jefe_inmediato",
+                    "etapa_actual": "jefe_inmediato",
+                    "jefe_asignado_id": jefe_asignado_id,
+                    "archivo": nombre_archivo
+                }
+            )
+        except Exception as error_auditoria:
+            print("advertencia: no se pudo registrar auditoría de firma solicitante:", error_auditoria)
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "PDF firmado recibido correctamente. La solicitud fue enviada al jefe inmediato asignado.",
+            "solicitud": {
+                "id": solicitud["id"],
+                "codigo_solicitud": codigo_solicitud,
+                "estado": "pendiente_jefe_inmediato",
+                "etapa_actual": "jefe_inmediato",
+                "jefe_asignado_id": jefe_asignado_id
+            },
+            "documento": {
+                "nombre_archivo": nombre_archivo,
+                "ruta_archivo": ruta_relativa,
+                "tipo_documento": "pdf_firmado_electronico"
+            }
+        }), 200
+
+    except Error as error:
+        try:
+            conexion.rollback()
+            conexion.close()
+        except Exception:
+            pass
+
+        print("ERROR MYSQL AL SUBIR PDF FIRMADO SOLICITANTE:", error)
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al subir el PDF firmado.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        try:
+            conexion.rollback()
+            conexion.close()
+        except Exception:
+            pass
+
+        print("ERROR GENERAL AL SUBIR PDF FIRMADO SOLICITANTE:", error)
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al subir el PDF firmado.",
+            "error": str(error)
+        }), 500
+# =====================================================
+# flujo electrónico - jefe inmediato sube PDF firmado
+# =====================================================
+
+@app.route("/api/solicitudes/<int:solicitud_id>/jefe/subir-firma", methods=["POST", "OPTIONS"])
+@token_requerido
+@roles_permitidos("jefe_inmediato")
+def jefe_subir_pdf_firmado(solicitud_id):
+    """
+    El jefe inmediato sube el PDF firmado electrónicamente.
+    La solicitud pasa a máxima autoridad.
+    """
+
+    if request.method == "OPTIONS":
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "preflight correcto."
+        }), 200
+
+    usuario_actual = request.usuario_actual
+    usuario_id = usuario_actual["id"]
+
+    if "archivo" not in request.files:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se recibió ningún archivo PDF firmado."
+        }), 400
+
+    archivo = request.files["archivo"]
+
+    if archivo.filename == "":
+        return jsonify({
+            "estado": "error",
+            "mensaje": "el archivo seleccionado no es válido."
+        }), 400
+
+    nombre_original = secure_filename(archivo.filename)
+    extension = os.path.splitext(nombre_original)[1].lower()
+
+    if extension != ".pdf":
+        return jsonify({
+            "estado": "error",
+            "mensaje": "solo se permite subir archivos PDF."
+        }), 400
+
+    conexion = get_db_connection()
+
+    if conexion is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo conectar con la base de datos."
+        }), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        # =====================================================
+        # validar solicitud asignada al jefe autenticado
+        # =====================================================
+
+        cursor.execute("""
+            select
+                id,
+                codigo_solicitud,
+                nombres_completos,
+                correo_institucional,
+                estado,
+                etapa_actual,
+                jefe_asignado_id,
+                area_id
+            from solicitudes
+            where id = %s
+            limit 1;
+        """, (solicitud_id,))
+
+        solicitud = cursor.fetchone()
+
+        if solicitud is None:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no se encontró la solicitud."
+            }), 404
+
+        if solicitud["estado"] != "pendiente_jefe_inmediato" or solicitud["etapa_actual"] != "jefe_inmediato":
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "la solicitud no está pendiente de revisión del jefe inmediato.",
+                "estado_actual": solicitud["estado"],
+                "etapa_actual": solicitud["etapa_actual"]
+            }), 400
+
+        if int(solicitud["jefe_asignado_id"] or 0) != int(usuario_id):
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "esta solicitud no está asignada al jefe autenticado."
+            }), 403
+
+        # =====================================================
+        # guardar archivo firmado por jefe
+        # =====================================================
+
+        codigo_solicitud = solicitud["codigo_solicitud"]
+
+        nombre_archivo = f"{codigo_solicitud}_firmado_jefe_{uuid.uuid4().hex[:8]}.pdf"
+        ruta_absoluta = os.path.join(FIRMADOS_FOLDER, nombre_archivo)
+
+        archivo.save(ruta_absoluta)
+
+        ruta_relativa = os.path.join("uploads", "firmados", nombre_archivo).replace("\\", "/")
+
+        # =====================================================
+        # registrar documento del jefe
+        # =====================================================
+
+        cursor.execute("""
+            insert into solicitud_documentos (
+                solicitud_id,
+                etapa,
+                rol_firmante,
+                usuario_id,
+                tipo_documento,
+                nombre_archivo,
+                ruta_archivo,
+                mime_type,
+                firmado,
+                firma_validada,
+                created_at,
+                updated_at
+            ) values (
+                %s,
+                'jefe_inmediato',
+                'jefe_inmediato',
+                %s,
+                'pdf_firmado_electronico',
+                %s,
+                %s,
+                'application/pdf',
+                true,
+                false,
+                now(),
+                now()
+            );
+        """, (
+            solicitud_id,
+            usuario_id,
+            nombre_archivo,
+            ruta_relativa
+        ))
+
+        # =====================================================
+        # enviar a máxima autoridad
+        # =====================================================
+
+        cursor.execute("""
+            update solicitudes
+            set
+                estado = 'pendiente_maxima_autoridad',
+                etapa_actual = 'maxima_autoridad',
+                updated_at = now()
+            where id = %s;
+        """, (solicitud_id,))
+
+        conexion.commit()
+
+        cursor.close()
+        conexion.close()
+
+        try:
+            registrar_auditoria(
+                usuario_id=usuario_id,
+                solicitud_id=solicitud_id,
+                modulo="firmaec_jefe",
+                accion="subir_pdf_firmado_jefe",
+                descripcion=f"Jefe inmediato subió PDF firmado y envió la solicitud {codigo_solicitud} a máxima autoridad.",
+                datos_anteriores={
+                    "estado": "pendiente_jefe_inmediato",
+                    "etapa_actual": "jefe_inmediato"
+                },
+                datos_nuevos={
+                    "estado": "pendiente_maxima_autoridad",
+                    "etapa_actual": "maxima_autoridad",
+                    "archivo": nombre_archivo
+                }
+            )
+        except Exception as error_auditoria:
+            print("advertencia: no se pudo registrar auditoría de firma del jefe:", error_auditoria)
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "PDF firmado por el jefe recibido correctamente. La solicitud fue enviada a máxima autoridad.",
+            "solicitud": {
+                "id": solicitud_id,
+                "codigo_solicitud": codigo_solicitud,
+                "estado": "pendiente_maxima_autoridad",
+                "etapa_actual": "maxima_autoridad"
+            },
+            "documento": {
+                "nombre_archivo": nombre_archivo,
+                "ruta_archivo": ruta_relativa,
+                "tipo_documento": "pdf_firmado_electronico"
+            }
+        }), 200
+
+    except Error as error:
+        try:
+            conexion.rollback()
+            conexion.close()
+        except Exception:
+            pass
+
+        print("ERROR MYSQL AL SUBIR PDF FIRMADO POR JEFE:", error)
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error al subir el PDF firmado por el jefe.",
+            "error": str(error)
+        }), 500
+
+    except Exception as error:
+        try:
+            conexion.rollback()
+            conexion.close()
+        except Exception:
+            pass
+
+        print("ERROR GENERAL AL SUBIR PDF FIRMADO POR JEFE:", error)
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "error inesperado al subir el PDF firmado por el jefe.",
+            "error": str(error)
+        }), 500
+
+
+
+
+
+
+
+# =====================================================
+# FIRMA ELECTRÓNICA — UTILIDADES INTERNAS
+# =====================================================
+
+def _sha256_archivo(ruta):
+    """Calcula el hash SHA-256 de un archivo en disco."""
+    h = hashlib.sha256()
+    try:
+        with open(ruta, "rb") as f:
+            for bloque in iter(lambda: f.read(65536), b""):
+                h.update(bloque)
+        return h.hexdigest()
+    except Exception:
+        return None
+
+
+def _leer_info_certificado(datos_p12, password_bytes):
+    """
+    Lee un certificado .p12/.pfx y devuelve un dict con la información
+    del titular, emisor, vigencia y número de serie.
+    Retorna (info_dict, error_string).
+    """
+    try:
+        private_key, cert, _chain = pkcs12.load_key_and_certificates(
+            datos_p12, password_bytes
+        )
+        if cert is None:
+            return None, "El archivo no contiene un certificado válido."
+
+        def _nombre(rdns):
+            atributos = {}
+            for rdn in rdns:
+                for attr in rdn:
+                    oid_dotted = attr.oid.dotted_string
+                    atributos[oid_dotted] = attr.value
+            cn = atributos.get("2.5.4.3", "")
+            o  = atributos.get("2.5.4.10", "")
+            return cn, o
+
+        subject_cn, subject_o = _nombre(cert.subject.rdns)
+        issuer_cn, _issuer_o  = _nombre(cert.issuer.rdns)
+
+        serial = format(cert.serial_number, "x").upper()
+        not_before = cert.not_valid_before_utc if hasattr(cert, "not_valid_before_utc") else cert.not_valid_before
+        not_after  = cert.not_valid_after_utc  if hasattr(cert, "not_valid_after_utc")  else cert.not_valid_after
+
+        ahora = datetime.datetime.now(datetime.timezone.utc)
+        vigente = not_before <= ahora <= not_after
+
+        return {
+            "subject_cn":       subject_cn,
+            "subject_o":        subject_o,
+            "issuer_cn":        issuer_cn,
+            "numero_serie":     serial,
+            "fecha_emision":    not_before.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "fecha_expiracion": not_after.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "vigente":          vigente,
+            "dias_restantes":   max(0, (not_after - ahora).days) if vigente else 0
+        }, None
+
+    except ValueError as e:
+        msg = str(e).lower()
+        if "password" in msg or "mac" in msg or "decrypt" in msg:
+            return None, "Contraseña del certificado incorrecta."
+        return None, f"Error al leer el certificado: {str(e)}"
+    except Exception as e:
+        return None, f"El archivo no es un certificado válido: {str(e)}"
+
+
+def _registrar_auditoria_firma(
+    solicitud_id, firma_id, usuario_id, rol,
+    accion, resultado, detalle=None, observacion=None,
+    subject_cn=None, numero_serie=None, issuer_cn=None,
+    hash_antes=None, hash_despues=None, ip=None
+):
+    """Registra en auditoria_firmas. No lanza excepciones."""
+    try:
+        conexion = get_db_connection()
+        if conexion is None:
+            return
+        cursor = conexion.cursor()
+        ahora = datetime.datetime.now()
+        cursor.execute("""
+            INSERT INTO auditoria_firmas (
+                solicitud_id, firma_id, usuario_id, rol, ip_cliente,
+                accion, subject_cn, numero_serie, issuer_cn,
+                hash_sha256_antes, hash_sha256_despues,
+                resultado, detalle, observacion, fecha, hora
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            solicitud_id, firma_id, usuario_id, rol, ip or obtener_ip_cliente(),
+            accion, subject_cn, numero_serie, issuer_cn,
+            hash_antes, hash_despues,
+            resultado, detalle, observacion,
+            ahora.date(), ahora.time()
+        ))
+        conexion.commit()
+        cursor.close()
+        conexion.close()
+    except Exception as e:
+        print(f"advertencia auditoria_firmas: {e}")
+
+
+def _registrar_version_documento(
+    solicitud_id, firma_id, usuario_id, etapa,
+    rol_firmante, tipo, nombre_archivo, ruta_archivo,
+    hash_sha256=None, tamano_bytes=None
+):
+    """Registra una versión de documento y marca las anteriores como no actuales."""
+    try:
+        conexion = get_db_connection()
+        if conexion is None:
+            return None
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            UPDATE versiones_documento
+            SET es_version_actual = 0
+            WHERE solicitud_id = %s
+        """, (solicitud_id,))
+
+        cursor.execute("""
+            SELECT COALESCE(MAX(version), 0) + 1 AS siguiente
+            FROM versiones_documento
+            WHERE solicitud_id = %s
+        """, (solicitud_id,))
+        row = cursor.fetchone()
+        version = row["siguiente"] if row else 1
+
+        cursor.execute("""
+            INSERT INTO versiones_documento (
+                solicitud_id, firma_id, usuario_id, version, etapa,
+                rol_firmante, tipo, nombre_archivo, ruta_archivo,
+                hash_sha256, tamano_bytes, es_version_actual
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
+        """, (
+            solicitud_id, firma_id, usuario_id, version, etapa,
+            rol_firmante, tipo, nombre_archivo, ruta_archivo,
+            hash_sha256, tamano_bytes
+        ))
+        version_id = cursor.lastrowid
+        conexion.commit()
+        cursor.close()
+        conexion.close()
+        return version_id
+    except Exception as e:
+        print(f"advertencia versiones_documento: {e}")
+        return None
+
+
+def _firmar_pdf_pyhanko(ruta_pdf_entrada, ruta_pdf_salida, ruta_cert, password_bytes,
+                        rol_firmante, razon, ubicacion, contacto, nombre_campo):
+    """
+    Aplica la firma digital criptográfica al PDF usando pyHanko.
+    - Genera PAdES compatible con FirmaEC y Adobe Acrobat.
+    - Coloca la firma visible exactamente en la columna del rol.
+    - Elimina el certificado temporal inmediatamente después de firmar.
+    Retorna (exito: bool, mensaje: str)
+    """
+    num_pagina, box = _encontrar_rect_firma(ruta_pdf_entrada, rol_firmante)
+    if box is None:
+        # Fallback con coordenadas aproximadas para A4 (bottom-left origin)
+        fallback = {
+            "solicitante":      (57,  82, 180, 138),
+            "jefe_inmediato":   (180, 82, 303, 138),
+            "maxima_autoridad": (303, 82, 427, 138),
+            "analista_tics":    (427, 82, 550, 138),
+        }
+        box = fallback.get(rol_firmante, (57, 82, 180, 138))
+        num_pagina = 0
+
+    try:
+        signer = signers.SimpleSigner.load_pkcs12(
+            pfx_file=ruta_cert,
+            passphrase=password_bytes
+        )
+
+        with open(ruta_pdf_entrada, "rb") as pdf_in:
+            w = IncrementalPdfFileWriter(pdf_in)
+
+            fields.append_signature_field(
+                w,
+                sig_field_spec=SigFieldSpec(
+                    sig_field_name=nombre_campo,
+                    on_page=num_pagina,
+                    box=box
+                )
+            )
+
+            sig_meta = PdfSignatureMetadata(
+                field_name=nombre_campo,
+                reason=razon,
+                location=ubicacion,
+                contact_info=contacto,
+                certify=False
+            )
+
+            with open(ruta_pdf_salida, "wb") as pdf_out:
+                asyncio.run(
+                    signers.async_sign_pdf(
+                        w,
+                        signature_meta=sig_meta,
+                        signer=signer,
+                        output=pdf_out
+                    )
+                )
+
+        return True, "ok"
+
+    except SigningError as e:
+        return False, f"Error de firma: {str(e)}"
+    except Exception as e:
+        return False, f"Error al firmar: {str(e)[:200]}"
+
+
+def _encontrar_rect_firma(ruta_pdf, rol_firmante):
+    """
+    Usa PyMuPDF para localizar el área exacta de la columna de firma del rol.
+
+    Estrategia robusta:
+    1. Busca primero el título de la sección "FIRMAS DE RESPONSABILIDAD" para anclar la y.
+    2. Dentro de esa página, busca el texto del encabezado de columna MÁS CERCANO
+       al título (mayor y en coordenadas PyMuPDF = más abajo en la página).
+    3. Si no encuentra el título, usa la ocurrencia con y más alto (más abajo).
+    4. Clamp del box dentro de los límites de la página.
+
+    Retorna (num_pagina, (x0, y0, x1, y1)) en coordenadas pyHanko (bottom-left).
+    """
+    mapa = {
+        "solicitante":      ["SOLICITANTE"],
+        "jefe_inmediato":   ["JEFE INMEDIATO"],
+        "maxima_autoridad": ["MÁXIMA AUTORIDAD", "MAXIMA AUTORIDAD", "XIMA AUTORIDAD"],
+        "analista_tics":    ["TICS"]
+    }
+    textos = mapa.get(rol_firmante, [])
+    if not textos:
+        return 0, None
+
+    COL_W   = 4.35 * 28.3465  # ≈ 123.3 pts
+    FIRMA_H = 56               # ≈ 2 cm
+    TITULO_SECCION = ["FIRMAS DE RESPONSABILIDAD", "FIRMAS DE RESPONSAB"]
+
+    doc = fitz.open(ruta_pdf)
+    try:
+        for pn in range(doc.page_count - 1, -1, -1):
+            page = doc[pn]
+            ph   = page.rect.height
+            pw   = page.rect.width
+
+            # Buscar y_min: la y del título de la sección de firmas (ancla)
+            y_anchor = 0.0
+            for t_sec in TITULO_SECCION:
+                sec_rects = page.search_for(t_sec)
+                if sec_rects:
+                    y_anchor = sec_rects[0].y0  # top del título
+                    break
+
+            # Buscar el texto del encabezado de columna
+            mejor_rect = None
+            for txt in textos:
+                todas = page.search_for(txt)
+                if not todas:
+                    continue
+                # Filtrar solo ocurrencias que estén DESPUÉS del título (y > y_anchor)
+                candidatos = [r for r in todas if r.y0 >= y_anchor]
+                if not candidatos:
+                    candidatos = todas  # fallback sin filtro
+                # Tomar la ocurrencia con mayor y (más abajo en la página)
+                mejor = max(candidatos, key=lambda r: r.y0)
+                if mejor_rect is None or mejor.y0 > mejor_rect.y0:
+                    mejor_rect = mejor
+
+            if mejor_rect is None:
+                continue
+
+            r = mejor_rect
+            x0    = r.x0
+            x1    = min(x0 + COL_W, pw - 2)  # clamp al ancho de página
+            y0_mu = r.y1 + 4
+            y1_mu = y0_mu + FIRMA_H
+
+            # Convertir PyMuPDF (top-left) → pyHanko (bottom-left)
+            box = (x0, ph - y1_mu, x1, ph - y0_mu)
+            return pn, box
+    finally:
+        doc.close()
+    return 0, None
+
+
+def _inicializar_tablas_firma():
+    """Crea las tablas de firma si no existen. Se llama al arrancar."""
+    sql_tablas = """
+    CREATE TABLE IF NOT EXISTS firmas_digitales (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        solicitud_id INT NOT NULL,
+        documento_id INT NULL,
+        usuario_id INT NOT NULL,
+        rol_firmante VARCHAR(50) NOT NULL,
+        etapa VARCHAR(50) NOT NULL,
+        modo_firma ENUM('pyhanko','firmaec') NOT NULL DEFAULT 'pyhanko',
+        subject_cn VARCHAR(255) NULL,
+        subject_o VARCHAR(255) NULL,
+        issuer_cn VARCHAR(255) NULL,
+        numero_serie VARCHAR(255) NULL,
+        fecha_emision DATE NULL,
+        fecha_expiracion DATE NULL,
+        nombre_pdf_entrada VARCHAR(255) NOT NULL,
+        nombre_pdf_firmado VARCHAR(255) NOT NULL,
+        ruta_pdf_firmado VARCHAR(512) NOT NULL,
+        hash_sha256_antes VARCHAR(64) NULL,
+        hash_sha256_despues VARCHAR(64) NULL,
+        firma_valida TINYINT(1) NOT NULL DEFAULT 0,
+        resultado_validacion TEXT NULL,
+        observacion VARCHAR(1000) NULL,
+        ip_cliente VARCHAR(45) NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_solicitud (solicitud_id),
+        INDEX idx_usuario (usuario_id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+    CREATE TABLE IF NOT EXISTS auditoria_firmas (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        solicitud_id INT NOT NULL,
+        firma_id INT NULL,
+        usuario_id INT NOT NULL,
+        rol VARCHAR(50) NOT NULL,
+        ip_cliente VARCHAR(45) NULL,
+        accion VARCHAR(100) NOT NULL,
+        subject_cn VARCHAR(255) NULL,
+        numero_serie VARCHAR(255) NULL,
+        issuer_cn VARCHAR(255) NULL,
+        hash_sha256_antes VARCHAR(64) NULL,
+        hash_sha256_despues VARCHAR(64) NULL,
+        resultado ENUM('exito','error','rechazado') NOT NULL DEFAULT 'exito',
+        detalle TEXT NULL,
+        observacion VARCHAR(1000) NULL,
+        fecha DATE NOT NULL,
+        hora TIME NOT NULL,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_solicitud (solicitud_id),
+        INDEX idx_usuario (usuario_id),
+        INDEX idx_fecha (fecha)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+    CREATE TABLE IF NOT EXISTS versiones_documento (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        solicitud_id INT NOT NULL,
+        firma_id INT NULL,
+        usuario_id INT NULL,
+        version INT NOT NULL DEFAULT 1,
+        etapa VARCHAR(50) NOT NULL,
+        rol_firmante VARCHAR(50) NULL,
+        tipo VARCHAR(50) NOT NULL,
+        nombre_archivo VARCHAR(255) NOT NULL,
+        ruta_archivo VARCHAR(512) NOT NULL,
+        hash_sha256 VARCHAR(64) NULL,
+        tamano_bytes INT NULL,
+        es_version_actual TINYINT(1) NOT NULL DEFAULT 0,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_solicitud (solicitud_id),
+        INDEX idx_actual (es_version_actual)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    """
+    try:
+        conexion = get_db_connection()
+        if conexion is None:
+            return
+        cursor = conexion.cursor()
+        for stmt in sql_tablas.split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                cursor.execute(stmt)
+        conexion.commit()
+        cursor.close()
+        conexion.close()
+    except Exception as e:
+        print(f"advertencia al crear tablas de firma: {e}")
+
+
+# =====================================================
+# ENDPOINT: Validar certificado .p12/.pfx
+# POST /api/admin/solicitudes/<id>/validar-certificado
+# =====================================================
+
+@app.route("/api/admin/solicitudes/<int:solicitud_id>/validar-certificado", methods=["POST"])
+@token_requerido
+@roles_permitidos("jefe_inmediato", "maxima_autoridad", "analista_tics")
+def validar_certificado_digital(solicitud_id):
+    if not PYHANKO_DISPONIBLE:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "El módulo de firma digital no está disponible en este servidor."
+        }), 503
+
+    if "certificado" not in request.files:
+        return jsonify({"estado": "error", "mensaje": "Debe adjuntar el archivo del certificado."}), 400
+
+    cert_file = request.files["certificado"]
+    password = request.form.get("password", "").strip()
+
+    if not cert_file or not cert_file.filename:
+        return jsonify({"estado": "error", "mensaje": "Archivo de certificado inválido."}), 400
+
+    nombre = cert_file.filename.lower()
+    if not (nombre.endswith(".p12") or nombre.endswith(".pfx")):
+        return jsonify({"estado": "error", "mensaje": "Solo se aceptan archivos .p12 o .pfx."}), 400
+
+    if not password:
+        return jsonify({"estado": "error", "mensaje": "Debe ingresar la contraseña del certificado."}), 400
+
+    datos_cert = cert_file.read()
+    if len(datos_cert) > 5 * 1024 * 1024:
+        return jsonify({"estado": "error", "mensaje": "El certificado no puede superar 5 MB."}), 400
+
+    info, error = _leer_info_certificado(datos_cert, password.encode("utf-8"))
+
+    if error:
+        return jsonify({"estado": "error", "mensaje": error}), 400
+
+    if not info["vigente"]:
+        return jsonify({
+            "estado": "error",
+            "mensaje": f"El certificado está expirado desde {info['fecha_expiracion']}.",
+            "info": info
+        }), 400
+
+    return jsonify({
+        "estado": "ok",
+        "mensaje": "Certificado válido y vigente.",
+        "info": info
+    }), 200
+
+
+# =====================================================
+# ENDPOINT: Firmar PDF con pyHanko (.p12/.pfx)
+# POST /api/admin/solicitudes/<id>/firmar-pyhanko
+# =====================================================
+
+@app.route("/api/admin/solicitudes/<int:solicitud_id>/firmar-pyhanko", methods=["POST"])
+@token_requerido
+@roles_permitidos("jefe_inmediato", "maxima_autoridad", "analista_tics")
+def firmar_pdf_con_pyhanko(solicitud_id):
+    if not PYHANKO_DISPONIBLE:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "El módulo de firma digital no está disponible. Contacte al administrador."
+        }), 503
+
+    usuario_actual = request.usuario_actual
+    rol_actual     = usuario_actual["rol"]
+    usuario_id     = usuario_actual["id"]
+    ip_cliente     = obtener_ip_cliente()
+
+    if "certificado" not in request.files:
+        return jsonify({"estado": "error", "mensaje": "Debe adjuntar el certificado .p12 o .pfx."}), 400
+
+    cert_file   = request.files["certificado"]
+    password    = request.form.get("password", "").strip()
+    observacion = normalizar_espacios(request.form.get("observacion", ""))
+
+    if not cert_file or not cert_file.filename:
+        return jsonify({"estado": "error", "mensaje": "Archivo de certificado inválido."}), 400
+
+    nombre_cert = cert_file.filename.lower()
+    if not (nombre_cert.endswith(".p12") or nombre_cert.endswith(".pfx")):
+        return jsonify({"estado": "error", "mensaje": "Solo se aceptan archivos .p12 o .pfx."}), 400
+
+    if not password:
+        return jsonify({"estado": "error", "mensaje": "Debe ingresar la contraseña del certificado."}), 400
+
+    datos_cert = cert_file.read()
+
+    # Validar certificado antes de firmar
+    info_cert, error_cert = _leer_info_certificado(datos_cert, password.encode("utf-8"))
+    if error_cert:
+        return jsonify({"estado": "error", "mensaje": error_cert}), 400
+
+    if not info_cert["vigente"]:
+        return jsonify({
+            "estado": "error",
+            "mensaje": f"El certificado ha expirado. No se puede firmar con un certificado inválido."
+        }), 400
+
+    # Obtener la solicitud de la base de datos
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "No se pudo conectar con la base de datos."}), 500
+
+    ruta_cert_tmp = None
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT id, codigo_solicitud, estado, etapa_actual, bloqueada,
+                   nombres_completos, nombre_jefe_area, nombre_maxima_autoridad, nombre_encargado_tics
+            FROM solicitudes
+            WHERE id = %s
+            LIMIT 1
+        """, (solicitud_id,))
+        solicitud = cursor.fetchone()
+
+        if solicitud is None:
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Solicitud no encontrada."}), 404
+
+        if solicitud["bloqueada"]:
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "La solicitud está bloqueada."}), 409
+
+        # Verificar que el rol puede firmar en la etapa actual
+        mapa_rol_etapa = {
+            "jefe_inmediato":   ["jefe_inmediato"],
+            "maxima_autoridad": ["maxima_autoridad"],
+            "analista_tics":    ["tics", "ejecucion_tics"]
+        }
+        etapas_permitidas = mapa_rol_etapa.get(rol_actual, [])
+        if solicitud["etapa_actual"] not in etapas_permitidas:
+            cursor.close(); conexion.close()
+            return jsonify({
+                "estado": "error",
+                "mensaje": f"No puede firmar en la etapa actual ({solicitud['etapa_actual']})."
+            }), 403
+
+        # Verificar que este rol no haya firmado ya
+        cursor.execute("""
+            SELECT id FROM firmas_digitales
+            WHERE solicitud_id = %s AND rol_firmante = %s
+            LIMIT 1
+        """, (solicitud_id, rol_actual))
+        firma_existente = cursor.fetchone()
+        if firma_existente:
+            cursor.close(); conexion.close()
+            return jsonify({
+                "estado": "error",
+                "mensaje": "Ya existe una firma digital registrada para su rol en esta solicitud."
+            }), 409
+
+        # Obtener el PDF más reciente para firmar
+        cursor.execute("""
+            SELECT nombre_archivo, ruta_archivo
+            FROM solicitud_documentos
+            WHERE solicitud_id = %s
+              AND (tipo_documento = 'pdf_firmado_electronico'
+                   OR tipo_documento = 'pdf_base'
+                   OR tipo_documento = 'pdf_tics'
+                   OR tipo_documento = 'pdf_final')
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (solicitud_id,))
+        doc_base = cursor.fetchone()
+
+        # Si no hay documento previo, generar el PDF base
+        if doc_base is None:
+            solicitud_pdf, paginas_web, error_pdf = obtener_solicitud_completa_para_pdf(solicitud_id)
+            if error_pdf:
+                cursor.close(); conexion.close()
+                return jsonify({"estado": "error", "mensaje": error_pdf}), 404
+
+            incluir_tics = rol_actual == "analista_tics"
+            pdf_buffer = generar_pdf_solicitud_a4(solicitud_pdf, paginas_web, incluir_seccion_tics=incluir_tics)
+
+            nombre_base_pdf = f"{solicitud['codigo_solicitud']}_base.pdf"
+            ruta_base_pdf   = os.path.join(DOCUMENTOS_FOLDER, nombre_base_pdf)
+            with open(ruta_base_pdf, "wb") as f:
+                f.write(pdf_buffer.getvalue())
+
+            ruta_pdf_entrada  = ruta_base_pdf
+            nombre_pdf_entrada = nombre_base_pdf
+        else:
+            ruta_pdf_entrada  = doc_base["ruta_archivo"]
+            nombre_pdf_entrada = doc_base["nombre_archivo"]
+
+        # Generar nombre del PDF firmado (versionado, nunca sobrescribir)
+        timestamp     = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        nombre_pdf_firmado = f"{solicitud['codigo_solicitud']}_{rol_actual}_pyhanko_{timestamp}.pdf"
+        ruta_pdf_firmado   = os.path.join(FIRMADOS_FOLDER, nombre_pdf_firmado)
+
+        # Hash del PDF de entrada
+        hash_antes = _sha256_archivo(ruta_pdf_entrada)
+
+        # Escribir certificado en archivo temporal (se borrará inmediatamente después de firmar)
+        ruta_cert_tmp = os.path.join(TEMP_CERTS_FOLDER, f"cert_{usuario_id}_{timestamp}.p12")
+        with open(ruta_cert_tmp, "wb") as f:
+            f.write(datos_cert)
+
+        # --- FIRMA CON PYHANKO (función centralizada) ---
+        nombre_campo = f"Firma_{rol_actual}_{timestamp}"
+        try:
+            exito_firma, msg_firma = _firmar_pdf_pyhanko(
+                ruta_pdf_entrada=ruta_pdf_entrada,
+                ruta_pdf_salida=ruta_pdf_firmado,
+                ruta_cert=ruta_cert_tmp,
+                password_bytes=password.encode("utf-8"),
+                rol_firmante=rol_actual,
+                razon=f"Aprobación institucional — {etapa_legible_pdf(solicitud['etapa_actual'])}",
+                ubicacion="Ecuador — INAMHI",
+                contacto=usuario_actual.get("correo", "inamhi@gob.ec"),
+                nombre_campo=nombre_campo
+            )
+        finally:
+            if ruta_cert_tmp and os.path.exists(ruta_cert_tmp):
+                try:
+                    os.remove(ruta_cert_tmp)
+                except Exception:
+                    pass
+            ruta_cert_tmp = None
+
+        if not exito_firma:
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": msg_firma}), 500
+
+        if not os.path.exists(ruta_pdf_firmado):
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "No se pudo generar el PDF firmado."}), 500
+
+        hash_despues = _sha256_archivo(ruta_pdf_firmado)
+        tamano_bytes = os.path.getsize(ruta_pdf_firmado)
+
+        # Validar firma recién generada
+        resultado_validacion = "ok"
+        try:
+            with open(ruta_pdf_firmado, "rb") as f_val:
+                r_val = PdfFileReader(f_val)
+                firmas_emb = r_val.embedded_signatures
+                if not firmas_emb:
+                    resultado_validacion = "sin_firmas_detectadas"
+                else:
+                    estado_val = asyncio.run(validate_pdf_signature(firmas_emb[0]))
+                    resultado_validacion = (
+                        "valida" if estado_val.valid else "invalida"
+                    )
+        except Exception as e_val:
+            resultado_validacion = f"no_validado: {str(e_val)[:100]}"
+
+        # Registrar firma en firmas_digitales
+        cursor.execute("""
+            INSERT INTO firmas_digitales (
+                solicitud_id, usuario_id, rol_firmante, etapa, modo_firma,
+                subject_cn, subject_o, issuer_cn, numero_serie,
+                nombre_pdf_entrada, nombre_pdf_firmado, ruta_pdf_firmado,
+                hash_sha256_antes, hash_sha256_despues,
+                firma_valida, resultado_validacion, observacion, ip_cliente
+            ) VALUES (%s,%s,%s,%s,'pyhanko',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            solicitud_id, usuario_id, rol_actual, solicitud["etapa_actual"],
+            info_cert["subject_cn"], info_cert["subject_o"],
+            info_cert["issuer_cn"], info_cert["numero_serie"],
+            nombre_pdf_entrada, nombre_pdf_firmado, ruta_pdf_firmado,
+            hash_antes, hash_despues,
+            1 if resultado_validacion in ("ok", "valida") else 0,
+            resultado_validacion, observacion, ip_cliente
+        ))
+        firma_id = cursor.lastrowid
+
+        # Registrar en solicitud_documentos
+        cursor.execute("""
+            INSERT INTO solicitud_documentos (
+                solicitud_id, etapa, rol_firmante, usuario_id,
+                tipo_documento, nombre_archivo, ruta_archivo,
+                mime_type, firmado, firma_validada, observacion
+            ) VALUES (%s,%s,%s,%s,'pdf_firmado_electronico',%s,%s,'application/pdf',1,1,%s)
+        """, (
+            solicitud_id, solicitud["etapa_actual"], rol_actual, usuario_id,
+            nombre_pdf_firmado, ruta_pdf_firmado,
+            f"PDF firmado digitalmente con pyHanko por {rol_actual}. Cert: {info_cert['subject_cn']}"
+        ))
+        documento_id = cursor.lastrowid
+
+        conexion.commit()
+
+        # Auditoría y versionamiento
+        _registrar_auditoria_firma(
+            solicitud_id=solicitud_id, firma_id=firma_id,
+            usuario_id=usuario_id, rol=rol_actual,
+            accion="firma_pyhanko", resultado="exito",
+            detalle=f"PDF firmado con pyHanko. Validación: {resultado_validacion}",
+            observacion=observacion,
+            subject_cn=info_cert["subject_cn"],
+            numero_serie=info_cert["numero_serie"],
+            issuer_cn=info_cert["issuer_cn"],
+            hash_antes=hash_antes, hash_despues=hash_despues,
+            ip=ip_cliente
+        )
+        _registrar_version_documento(
+            solicitud_id=solicitud_id, firma_id=firma_id,
+            usuario_id=usuario_id, etapa=solicitud["etapa_actual"],
+            rol_firmante=rol_actual, tipo="pdf_firmado_pyhanko",
+            nombre_archivo=nombre_pdf_firmado,
+            ruta_archivo=ruta_pdf_firmado,
+            hash_sha256=hash_despues, tamano_bytes=tamano_bytes
+        )
+
+        registrar_auditoria(
+            usuario_id=usuario_id,
+            solicitud_id=solicitud_id,
+            modulo="firma_digital",
+            accion="firmar_pdf_pyhanko",
+            descripcion=f"Firma digital pyHanko por {rol_actual}. Cert: {info_cert['subject_cn']}",
+            datos_anteriores=None,
+            datos_nuevos={
+                "firma_id": firma_id,
+                "documento_id": documento_id,
+                "nombre_pdf": nombre_pdf_firmado,
+                "hash_antes": hash_antes,
+                "hash_despues": hash_despues,
+                "validacion": resultado_validacion
+            }
+        )
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "PDF firmado digitalmente de forma exitosa.",
+            "firma": {
+                "id": firma_id,
+                "modo": "pyhanko",
+                "nombre_pdf": nombre_pdf_firmado,
+                "hash_sha256": hash_despues,
+                "validacion": resultado_validacion,
+                "certificado": {
+                    "subject_cn": info_cert["subject_cn"],
+                    "issuer_cn":  info_cert["issuer_cn"],
+                    "numero_serie": info_cert["numero_serie"],
+                    "vigente": info_cert["vigente"]
+                }
+            },
+            "documento": {
+                "id": documento_id,
+                "solicitud_id": solicitud_id,
+                "tipo_documento": "pdf_firmado_electronico",
+                "nombre_archivo": nombre_pdf_firmado,
+                "rol_firmante": rol_actual,
+                "etapa": solicitud["etapa_actual"],
+                "firmado": True,
+                "firma_validada": True
+            }
+        }), 201
+
+    except Exception as error:
+        # Borrar cert temporal en caso de error
+        if ruta_cert_tmp and os.path.exists(ruta_cert_tmp):
+            try:
+                os.remove(ruta_cert_tmp)
+            except Exception:
+                pass
+
+        try:
+            conexion.rollback()
+            conexion.close()
+        except Exception:
+            pass
+
+        _registrar_auditoria_firma(
+            solicitud_id=solicitud_id, firma_id=None,
+            usuario_id=usuario_actual.get("id", 0),
+            rol=usuario_actual.get("rol", ""),
+            accion="firma_pyhanko", resultado="error",
+            detalle=str(error)[:500], ip=ip_cliente
+        )
+
+        return jsonify({
+            "estado": "error",
+            "mensaje": "Error al firmar el PDF digitalmente.",
+            "error": str(error)[:200]
+        }), 500
+
+
+# =====================================================
+# ENDPOINT: Verificación pública via QR
+# GET /api/public/verificar/<codigo_solicitud>
+# =====================================================
+
+@app.route("/api/public/verificar/<codigo_solicitud>", methods=["GET"])
+def verificar_documento_publico(codigo_solicitud):
+    codigo_solicitud = limpiar_texto(codigo_solicitud).upper()
+
+    if not codigo_solicitud:
+        return jsonify({"estado": "error", "mensaje": "Código de solicitud requerido."}), 400
+
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "No se pudo conectar con la base de datos."}), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            SELECT id, codigo_solicitud, nombres_completos, estado, etapa_actual, created_at
+            FROM solicitudes
+            WHERE codigo_solicitud = %s
+            LIMIT 1
+        """, (codigo_solicitud,))
+        solicitud = cursor.fetchone()
+
+        if solicitud is None:
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Solicitud no encontrada."}), 404
+
+        # Obtener firmas registradas
+        cursor.execute("""
+            SELECT rol_firmante, subject_cn, issuer_cn, numero_serie,
+                   modo_firma, firma_valida, hash_sha256_despues, created_at
+            FROM firmas_digitales
+            WHERE solicitud_id = %s
+            ORDER BY created_at ASC
+        """, (solicitud["id"],))
+        firmas = cursor.fetchall()
+
+        # Versión actual del documento
+        cursor.execute("""
+            SELECT version, nombre_archivo, hash_sha256, created_at
+            FROM versiones_documento
+            WHERE solicitud_id = %s AND es_version_actual = 1
+            LIMIT 1
+        """, (solicitud["id"],))
+        version_actual = cursor.fetchone()
+
+        cursor.close()
+        conexion.close()
+
+        firmantes = []
+        for f in firmas:
+            firmantes.append({
+                "rol":        f["rol_firmante"],
+                "titular":    f["subject_cn"] or "—",
+                "emisor":     f["issuer_cn"] or "—",
+                "serie":      f["numero_serie"] or "—",
+                "modo":       f["modo_firma"],
+                "valida":     bool(f["firma_valida"]),
+                "hash":       f["hash_sha256_despues"] or "—",
+                "fecha":      f["created_at"].strftime("%Y-%m-%d %H:%M") if f["created_at"] else "—"
+            })
+
+        return jsonify({
+            "estado": "ok",
+            "solicitud": {
+                "codigo":     solicitud["codigo_solicitud"],
+                "solicitante": solicitud["nombres_completos"],
+                "estado":     solicitud["estado"],
+                "etapa":      solicitud["etapa_actual"],
+                "fecha_registro": solicitud["created_at"].strftime("%Y-%m-%d") if solicitud["created_at"] else "—"
+            },
+            "firmantes":   firmantes,
+            "total_firmas": len(firmantes),
+            "version_actual": {
+                "version":  version_actual["version"] if version_actual else None,
+                "archivo":  version_actual["nombre_archivo"] if version_actual else None,
+                "hash":     version_actual["hash_sha256"] if version_actual else None,
+                "fecha":    version_actual["created_at"].strftime("%Y-%m-%d %H:%M") if version_actual and version_actual["created_at"] else None
+            } if version_actual else None,
+            "url_verificacion": f"{APP_URL}/api/public/verificar/{codigo_solicitud}"
+        }), 200
+
+    except Exception as error:
+        try:
+            conexion.close()
+        except Exception:
+            pass
+        return jsonify({
+            "estado": "error",
+            "mensaje": "Error al verificar el documento.",
+            "error": str(error)[:100]
+        }), 500
+
+
+# =====================================================
+# ENDPOINT: Historial de firmas de una solicitud
+# GET /api/admin/solicitudes/<id>/firmas
+# =====================================================
+
+@app.route("/api/admin/solicitudes/<int:solicitud_id>/firmas", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics")
+def listar_firmas_solicitud(solicitud_id):
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "No se pudo conectar con la base de datos."}), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            SELECT fd.id, fd.rol_firmante, fd.etapa, fd.modo_firma,
+                   fd.subject_cn, fd.issuer_cn, fd.numero_serie,
+                   fd.nombre_pdf_firmado, fd.hash_sha256_despues,
+                   fd.firma_valida, fd.resultado_validacion,
+                   fd.observacion, fd.created_at,
+                   u.nombres, u.apellidos
+            FROM firmas_digitales fd
+            LEFT JOIN usuarios u ON u.id = fd.usuario_id
+            WHERE fd.solicitud_id = %s
+            ORDER BY fd.created_at ASC
+        """, (solicitud_id,))
+        firmas = cursor.fetchall()
+
+        cursor.execute("""
+            SELECT id, version, etapa, rol_firmante, tipo,
+                   nombre_archivo, hash_sha256, tamano_bytes,
+                   es_version_actual, created_at
+            FROM versiones_documento
+            WHERE solicitud_id = %s
+            ORDER BY version ASC
+        """, (solicitud_id,))
+        versiones = cursor.fetchall()
+
+        cursor.close()
+        conexion.close()
+
+        for f in firmas:
+            if f.get("created_at"):
+                f["created_at"] = f["created_at"].strftime("%Y-%m-%d %H:%M:%S")
+            f["firma_valida"] = bool(f["firma_valida"])
+
+        for v in versiones:
+            if v.get("created_at"):
+                v["created_at"] = v["created_at"].strftime("%Y-%m-%d %H:%M:%S")
+            v["es_version_actual"] = bool(v["es_version_actual"])
+
+        return jsonify({
+            "estado": "ok",
+            "solicitud_id": solicitud_id,
+            "firmas": firmas,
+            "versiones": versiones,
+            "total_firmas": len(firmas),
+            "total_versiones": len(versiones)
+        }), 200
+
+    except Exception as error:
+        try:
+            conexion.close()
+        except Exception:
+            pass
+        return jsonify({
+            "estado": "error",
+            "mensaje": "Error al obtener el historial de firmas.",
+            "error": str(error)[:100]
+        }), 500
+
+
+# =====================================================
+# ENDPOINT: Descargar versión específica de documento
+# GET /api/admin/solicitudes/<id>/versiones/<version_id>/descargar
+# =====================================================
+
+@app.route("/api/admin/solicitudes/<int:solicitud_id>/versiones/<int:version_id>/descargar", methods=["GET"])
+@token_requerido
+@roles_permitidos("administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics")
+def descargar_version_documento(solicitud_id, version_id):
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "No se pudo conectar con la base de datos."}), 500
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute("""
+            SELECT nombre_archivo, ruta_archivo
+            FROM versiones_documento
+            WHERE id = %s AND solicitud_id = %s
+            LIMIT 1
+        """, (version_id, solicitud_id))
+        version = cursor.fetchone()
+        cursor.close()
+        conexion.close()
+
+        if version is None:
+            return jsonify({"estado": "error", "mensaje": "Versión no encontrada."}), 404
+
+        ruta = version["ruta_archivo"]
+        if not os.path.exists(ruta):
+            return jsonify({"estado": "error", "mensaje": "El archivo no existe en el servidor."}), 404
+
+        return send_file(
+            ruta,
+            as_attachment=True,
+            download_name=version["nombre_archivo"],
+            mimetype="application/pdf"
+        )
+
+    except Exception as error:
+        try:
+            conexion.close()
+        except Exception:
+            pass
+        return jsonify({"estado": "error", "mensaje": str(error)[:100]}), 500
+
+
+# =====================================================
+# ENDPOINT PÚBLICO: Validar certificado (sin JWT)
+# POST /api/public/electronico/<codigo>/validar-certificado-publico
+# =====================================================
+
+@app.route("/api/public/electronico/<codigo_solicitud>/validar-certificado-publico", methods=["POST", "OPTIONS"])
+def validar_certificado_publico(codigo_solicitud):
+    if request.method == "OPTIONS":
+        return jsonify({"estado": "ok"}), 200
+
+    if not PYHANKO_DISPONIBLE:
+        return jsonify({"estado": "error", "mensaje": "Módulo de firma digital no disponible."}), 503
+
+    if "certificado" not in request.files:
+        return jsonify({"estado": "error", "mensaje": "Debe adjuntar el archivo del certificado."}), 400
+
+    cert_file = request.files["certificado"]
+    password  = request.form.get("password", "").strip()
+
+    nombre = (cert_file.filename or "").lower()
+    if not (nombre.endswith(".p12") or nombre.endswith(".pfx")):
+        return jsonify({"estado": "error", "mensaje": "Solo se aceptan archivos .p12 o .pfx."}), 400
+
+    if not password:
+        return jsonify({"estado": "error", "mensaje": "Ingrese la contraseña del certificado."}), 400
+
+    datos_cert = cert_file.read()
+    if len(datos_cert) > 5 * 1024 * 1024:
+        return jsonify({"estado": "error", "mensaje": "El certificado no puede superar 5 MB."}), 400
+
+    info, error = _leer_info_certificado(datos_cert, password.encode("utf-8"))
+    if error:
+        return jsonify({"estado": "error", "mensaje": error}), 400
+
+    if not info["vigente"]:
+        return jsonify({
+            "estado": "error",
+            "mensaje": f"El certificado está expirado desde {info['fecha_expiracion']}.",
+            "info": info
+        }), 400
+
+    return jsonify({"estado": "ok", "mensaje": "Certificado válido y vigente.", "info": info}), 200
+
+
+# =====================================================
+# ENDPOINT PÚBLICO: Firmar PDF en columna SOLICITANTE
+# POST /api/public/electronico/<codigo>/firmar-pyhanko-solicitante
+# No requiere JWT — el solicitante es el usuario público
+# =====================================================
+
+@app.route("/api/public/electronico/<codigo_solicitud>/firmar-pyhanko-solicitante", methods=["POST", "OPTIONS"])
+def firmar_pyhanko_solicitante(codigo_solicitud):
+    if request.method == "OPTIONS":
+        return jsonify({"estado": "ok"}), 200
+
+    if not PYHANKO_DISPONIBLE:
+        return jsonify({"estado": "error", "mensaje": "Módulo de firma digital no disponible en el servidor."}), 503
+
+    codigo_solicitud = limpiar_texto(codigo_solicitud).upper()
+    if not codigo_solicitud:
+        return jsonify({"estado": "error", "mensaje": "Código de solicitud requerido."}), 400
+
+    if "certificado" not in request.files:
+        return jsonify({"estado": "error", "mensaje": "Debe adjuntar el certificado .p12 o .pfx."}), 400
+
+    cert_file   = request.files["certificado"]
+    password    = request.form.get("password", "").strip()
+    observacion = normalizar_espacios(request.form.get("observacion", ""))
+
+    nombre_cert = (cert_file.filename or "").lower()
+    if not (nombre_cert.endswith(".p12") or nombre_cert.endswith(".pfx")):
+        return jsonify({"estado": "error", "mensaje": "Solo se aceptan archivos .p12 o .pfx."}), 400
+
+    if not password:
+        return jsonify({"estado": "error", "mensaje": "Ingrese la contraseña del certificado."}), 400
+
+    datos_cert = cert_file.read()
+
+    # Validar certificado
+    info_cert, error_cert = _leer_info_certificado(datos_cert, password.encode("utf-8"))
+    if error_cert:
+        return jsonify({"estado": "error", "mensaje": error_cert}), 400
+    if not info_cert["vigente"]:
+        return jsonify({"estado": "error", "mensaje": "El certificado ha expirado. No se puede firmar."}), 400
+
+    ip_cliente = obtener_ip_cliente()
+
+    conexion = get_db_connection()
+    if conexion is None:
+        return jsonify({"estado": "error", "mensaje": "No se pudo conectar con la base de datos."}), 500
+
+    ruta_cert_tmp = None
+
+    try:
+        cursor = conexion.cursor(dictionary=True)
+
+        cursor.execute("""
+            SELECT s.id, s.codigo_solicitud, s.estado, s.etapa_actual,
+                   s.nombres_completos, s.correo_institucional,
+                   s.jefe_asignado_id, s.area_id
+            FROM solicitudes s
+            WHERE s.codigo_solicitud = %s
+            LIMIT 1
+        """, (codigo_solicitud,))
+        solicitud = cursor.fetchone()
+
+        if solicitud is None:
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Solicitud no encontrada."}), 404
+
+        if solicitud["estado"] != "pendiente_firma_solicitante":
+            cursor.close(); conexion.close()
+            return jsonify({
+                "estado": "error",
+                "mensaje": f"La solicitud no está en espera de firma. Estado actual: {solicitud['estado']}."
+            }), 409
+
+        # Verificar que no haya firmado ya
+        cursor.execute("""
+            SELECT id FROM firmas_digitales
+            WHERE solicitud_id = %s AND rol_firmante = 'solicitante'
+            LIMIT 1
+        """, (solicitud["id"],))
+        if cursor.fetchone():
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "Este solicitante ya firmó el documento."}), 409
+
+        solicitud_id = solicitud["id"]
+
+        # Obtener correo y nombre del jefe asignado
+        correo_jefe = ""
+        nombre_jefe = "Jefe inmediato"
+        jefe_asignado_id = solicitud.get("jefe_asignado_id")
+        if jefe_asignado_id:
+            cursor.execute("""
+                SELECT nombres, apellidos, correo
+                FROM usuarios WHERE id = %s LIMIT 1
+            """, (jefe_asignado_id,))
+            jefe_usr = cursor.fetchone()
+            if jefe_usr:
+                nombre_jefe = f"{jefe_usr.get('nombres','')} {jefe_usr.get('apellidos','')}".strip()
+                correo_jefe = jefe_usr.get("correo") or ""
+
+        # Obtener datos completos para generar PDF
+        solicitud_pdf, paginas_web, error_pdf = obtener_solicitud_completa_para_pdf(solicitud_id)
+        if error_pdf:
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": error_pdf}), 404
+
+        # Generar PDF base
+        pdf_buffer = generar_pdf_solicitud_a4(solicitud_pdf, paginas_web, incluir_seccion_tics=False)
+
+        nombre_base_pdf = f"{codigo_solicitud}_base.pdf"
+        ruta_base_pdf   = os.path.join(DOCUMENTOS_FOLDER, nombre_base_pdf)
+        with open(ruta_base_pdf, "wb") as f:
+            f.write(pdf_buffer.getvalue())
+
+        # Nombre del PDF firmado
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        nombre_pdf_firmado = f"{codigo_solicitud}_solicitante_pyhanko_{timestamp}.pdf"
+        ruta_pdf_firmado   = os.path.join(FIRMADOS_FOLDER, nombre_pdf_firmado)
+
+        hash_antes = _sha256_archivo(ruta_base_pdf)
+
+        # Guardar certificado temporal
+        ruta_cert_tmp = os.path.join(TEMP_CERTS_FOLDER, f"cert_pub_{timestamp}.p12")
+        with open(ruta_cert_tmp, "wb") as f:
+            f.write(datos_cert)
+
+        # --- FIRMA CON PYHANKO EN COLUMNA SOLICITANTE ---
+        nombre_campo = f"Firma_solicitante_{timestamp}"
+        try:
+            exito_firma, msg_firma = _firmar_pdf_pyhanko(
+                ruta_pdf_entrada=ruta_base_pdf,
+                ruta_pdf_salida=ruta_pdf_firmado,
+                ruta_cert=ruta_cert_tmp,
+                password_bytes=password.encode("utf-8"),
+                rol_firmante="solicitante",
+                razon="Firma electrónica del solicitante — INAMHI",
+                ubicacion="Ecuador — INAMHI",
+                contacto=solicitud.get("correo_institucional", ""),
+                nombre_campo=nombre_campo
+            )
+        finally:
+            if ruta_cert_tmp and os.path.exists(ruta_cert_tmp):
+                try:
+                    os.remove(ruta_cert_tmp)
+                except Exception:
+                    pass
+            ruta_cert_tmp = None
+
+        if not exito_firma:
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": msg_firma}), 500
+
+        if not os.path.exists(ruta_pdf_firmado):
+            cursor.close(); conexion.close()
+            return jsonify({"estado": "error", "mensaje": "No se pudo generar el PDF firmado."}), 500
+
+        hash_despues = _sha256_archivo(ruta_pdf_firmado)
+        tamano_bytes = os.path.getsize(ruta_pdf_firmado)
+
+        # Validar firma
+        resultado_validacion = "ok"
+        try:
+            with open(ruta_pdf_firmado, "rb") as f_val:
+                r_val = PdfFileReader(f_val)
+                firmas_emb = r_val.embedded_signatures
+                if firmas_emb:
+                    estado_val = asyncio.run(validate_pdf_signature(firmas_emb[0]))
+                    resultado_validacion = "valida" if estado_val.valid else "invalida"
+                else:
+                    resultado_validacion = "sin_firmas_detectadas"
+        except Exception as e_val:
+            resultado_validacion = f"no_validado: {str(e_val)[:80]}"
+
+        # Registrar en firmas_digitales
+        cursor.execute("""
+            INSERT INTO firmas_digitales (
+                solicitud_id, usuario_id, rol_firmante, etapa, modo_firma,
+                subject_cn, subject_o, issuer_cn, numero_serie,
+                nombre_pdf_entrada, nombre_pdf_firmado, ruta_pdf_firmado,
+                hash_sha256_antes, hash_sha256_despues,
+                firma_valida, resultado_validacion, observacion, ip_cliente
+            ) VALUES (%s,NULL,'solicitante','firma_solicitante','pyhanko',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+        """, (
+            solicitud_id,
+            info_cert["subject_cn"], info_cert["subject_o"],
+            info_cert["issuer_cn"], info_cert["numero_serie"],
+            nombre_base_pdf, nombre_pdf_firmado, ruta_pdf_firmado,
+            hash_antes, hash_despues,
+            1 if resultado_validacion in ("ok", "valida") else 0,
+            resultado_validacion, observacion, ip_cliente
+        ))
+        firma_id = cursor.lastrowid
+
+        # Registrar en solicitud_documentos
+        cursor.execute("""
+            INSERT INTO solicitud_documentos (
+                solicitud_id, etapa, rol_firmante, usuario_id,
+                tipo_documento, nombre_archivo, ruta_archivo,
+                mime_type, firmado, firma_validada, observacion
+            ) VALUES (%s,'firma_solicitante','solicitante',NULL,
+                      'pdf_firmado_electronico',%s,%s,'application/pdf',1,1,%s)
+        """, (
+            solicitud_id, nombre_pdf_firmado, ruta_pdf_firmado,
+            f"PDF firmado con pyHanko por solicitante. Cert: {info_cert['subject_cn']}"
+        ))
+
+        # Obtener correo del jefe para notificación
+        correo_jefe = solicitud.get("correo_jefe_area") or ""
+
+        # Avanzar estado a pendiente_jefe_inmediato
+        cursor.execute("""
+            UPDATE solicitudes
+            SET estado = 'pendiente_jefe_inmediato',
+                etapa_actual = 'jefe_inmediato',
+                updated_at = NOW()
+            WHERE id = %s
+        """, (solicitud_id,))
+
+        conexion.commit()
+
+        # Versionamiento
+        _registrar_version_documento(
+            solicitud_id=solicitud_id, firma_id=firma_id,
+            usuario_id=None, etapa="firma_solicitante",
+            rol_firmante="solicitante", tipo="pdf_firmado_pyhanko",
+            nombre_archivo=nombre_pdf_firmado,
+            ruta_archivo=ruta_pdf_firmado,
+            hash_sha256=hash_despues, tamano_bytes=tamano_bytes
+        )
+
+        # Auditoría
+        _registrar_auditoria_firma(
+            solicitud_id=solicitud_id, firma_id=firma_id,
+            usuario_id=0, rol="solicitante",
+            accion="firma_pyhanko_solicitante", resultado="exito",
+            detalle=f"PDF firmado por solicitante. Validación: {resultado_validacion}",
+            observacion=observacion,
+            subject_cn=info_cert["subject_cn"],
+            numero_serie=info_cert["numero_serie"],
+            issuer_cn=info_cert["issuer_cn"],
+            hash_antes=hash_antes, hash_despues=hash_despues,
+            ip=ip_cliente
+        )
+
+        # Enviar notificación al jefe
+        correo_enviado = False
+        error_correo = None
+        if correo_jefe:
+            try:
+                cuerpo_txt = (
+                    f"Estimado/a {nombre_jefe},\n\n"
+                    f"El solicitante {solicitud['nombres_completos']} firmó electrónicamente su solicitud.\n"
+                    f"Código: {codigo_solicitud}\n\n"
+                    f"La solicitud está pendiente de su revisión y aprobación.\n\n"
+                    f"Sistema INAMHI"
+                )
+                cuerpo_html = f"""
+                <html><body style="font-family:Inter,Arial,sans-serif;background:#f8fafc;margin:0;padding:0;">
+                <div style="max-width:600px;margin:32px auto;background:#fff;border-radius:16px;
+                            box-shadow:0 4px 20px rgba(0,0,0,0.08);overflow:hidden;">
+                  <div style="background:linear-gradient(135deg,#1e40af,#2563eb);padding:28px 32px;text-align:center;">
+                    {_logo_email_tag()}
+                    <h2 style="color:#fff;margin:0;font-size:20px;">Solicitud firmada electrónicamente</h2>
+                  </div>
+                  <div style="padding:28px 32px;">
+                    <p style="color:#334155;">Estimado/a <strong>{nombre_jefe}</strong>,</p>
+                    <p style="color:#334155;">El solicitante firmó digitalmente su solicitud y requiere su revisión:</p>
+                    <div style="background:#eff6ff;border-left:4px solid #2563eb;padding:16px;border-radius:8px;margin:16px 0;">
+                      <p style="margin:0 0 6px;color:#1e40af;font-weight:700;">Código: {codigo_solicitud}</p>
+                      <p style="margin:0;color:#334155;">Solicitante: <strong>{solicitud['nombres_completos']}</strong></p>
+                    </div>
+                    <p style="color:#64748b;font-size:13px;">Ingrese al sistema para revisar y aprobar o rechazar la solicitud.</p>
+                  </div>
+                  <div style="background:#f1f5f9;padding:16px 32px;text-align:center;">
+                    <p style="color:#94a3b8;font-size:12px;margin:0;">INAMHI — Sistema de Gestión de Solicitudes</p>
+                  </div>
+                </div></body></html>"""
+                enviar_correo(correo_jefe, f"Nueva solicitud firmada — {codigo_solicitud}", cuerpo_txt, cuerpo_html)
+                correo_enviado = True
+            except Exception as e_correo:
+                error_correo = str(e_correo)
+
+        cursor.close()
+        conexion.close()
+
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "Documento firmado digitalmente. Su solicitud avanzó al jefe inmediato.",
+            "codigo_solicitud": codigo_solicitud,
+            "firma": {
+                "id": firma_id,
+                "modo": "pyhanko",
+                "nombre_pdf": nombre_pdf_firmado,
+                "hash_sha256": hash_despues,
+                "validacion": resultado_validacion,
+                "certificado": {
+                    "subject_cn":   info_cert["subject_cn"],
+                    "issuer_cn":    info_cert["issuer_cn"],
+                    "numero_serie": info_cert["numero_serie"],
+                    "vigente":      info_cert["vigente"]
+                }
+            },
+            "correo_enviado": correo_enviado,
+            "error_correo": error_correo
+        }), 201
+
+    except Exception as error:
+        if ruta_cert_tmp and os.path.exists(ruta_cert_tmp):
+            try:
+                os.remove(ruta_cert_tmp)
+            except Exception:
+                pass
+        try:
+            conexion.rollback()
+            conexion.close()
+        except Exception:
+            pass
+        return jsonify({
+            "estado": "error",
+            "mensaje": "Error al firmar el documento.",
+            "error": str(error)[:200]
+        }), 500
+
+
+# Inicializar tablas de firma al arrancar
+_inicializar_tablas_firma()
+
+
+# =====================================================
+# iniciar servidor
+# =====================================================
+
+if __name__ == "__main__":
+    IP_RED = "10.0.5.120"
+
+    # Inicializar pool de conexiones antes de servir requests
+    init_db(app)
+
+    print("=" * 42)
+    print(" INAMHI — Backend Liberación Web")
+    print("=" * 42)
+    print(f" Puerto        : {BACKEND_PORT}")
+    print(f" BD pool       : {DB_NAME}@{DB_HOST}")
+    print(f" Local         : http://127.0.0.1:{BACKEND_PORT}/api/test")
+    print(f" Red           : http://{IP_RED}:{BACKEND_PORT}/api/test")
+    print(f" Frontend      : http://localhost:4300")
+    print(f" Angular red   : ng serve --host 0.0.0.0 --port 4300")
+    print("=" * 42)
+
+    app.run(host="0.0.0.0", port=BACKEND_PORT, debug=False)

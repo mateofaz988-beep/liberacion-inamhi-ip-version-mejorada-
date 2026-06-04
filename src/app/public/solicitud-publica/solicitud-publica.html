@@ -1,0 +1,845 @@
+<section class="solicitud-page">
+  <header class="institutional-header">
+    <div class="header-content">
+      <a routerLink="/" class="back-link">
+        ← Volver al inicio
+      </a>
+
+      <div class="brand">
+        <img
+          src="/inamhi-logo-LETRA-AZUL.png"
+          alt="Logo INAMHI"
+          class="login-logo-inamhi"
+        />
+
+        <div>
+          <h1>Formulario de Solicitud</h1>
+          <p>Sistema de Gestión de Solicitudes de Liberación Web - INAMHI</p>
+        </div>
+      </div>
+
+      <div class="status-pill">
+        Proceso electrónico
+      </div>
+    </div>
+  </header>
+
+  <main class="page-content">
+    <section class="summary-card" *ngIf="!enviado">
+      <div>
+        <span class="eyebrow">Acceso Superior a Internet</span>
+
+        <h2>Solicitud de Liberación Web Institucional</h2>
+
+        <p>
+          Complete la información requerida. El sistema generará automáticamente
+          el ID único y el formato PDF. Luego deberá firmar el documento
+          externamente con FirmaEC y subir el PDF firmado.
+        </p>
+      </div>
+
+      
+    </section>
+
+    <section class="success-card" *ngIf="enviado">
+      <div class="success-icon">✓</div>
+
+      <h3>Solicitud enviada al jefe inmediato</h3>
+
+      <p>
+        El PDF firmado electrónicamente fue recibido correctamente.
+        Guarde este código para consultar el estado de su solicitud:
+      </p>
+
+      <strong>{{ codigoGenerado }}</strong>
+
+      <div class="success-actions">
+        <a routerLink="/public/seguimiento">
+          Consultar estado
+        </a>
+
+        <button type="button" (click)="enviado = false; reiniciarFlujoFirmaEc()">
+          Registrar otra solicitud
+        </button>
+      </div>
+    </section>
+
+    <form
+      class="form-card"
+      [formGroup]="formulario"
+      (ngSubmit)="enviarSolicitud()"
+      *ngIf="!enviado"
+    >
+      <div class="form-header">
+        <div>
+          <h3>Datos de la solicitud</h3>
+          <p>Los campos marcados con * son obligatorios.</p>
+        </div>
+
+        <div class="form-code">
+          Firma electrónica con FirmaEC
+        </div>
+      </div>
+
+      <div class="firmaec-info-card">
+        <div class="firmaec-info-icon">
+          <i class="bi bi-shield-check"></i>
+        </div>
+
+        <div>
+          <h4>Proceso con FirmaEC</h4>
+          <p>
+            Al continuar, el sistema generará automáticamente el ID único y el
+            formato PDF institucional. Usted deberá descargarlo, firmarlo desde
+            la aplicación FirmaEC instalada en su equipo y luego subir aquí el
+            PDF firmado.
+          </p>
+        </div>
+      </div>
+
+      <!-- =====================================================
+           SECCIÓN 1: INFORMACIÓN DEL SOLICITANTE
+      ====================================================== -->
+
+      <div class="section-title">
+        <span>1</span>
+
+        <div>
+          <h4>Información del solicitante</h4>
+          <p>Datos del funcionario, usuario externo o solicitante responsable.</p>
+        </div>
+      </div>
+
+      <div class="grid two">
+        <label>
+          Nombres completos *
+          <input
+            type="text"
+            formControlName="nombres_completos"
+            placeholder="Ejemplo: Juan Carlos Pérez López"
+            maxlength="200"
+            (input)="limpiarTextoSimple('nombres_completos')"
+          />
+
+          <small *ngIf="campoInvalido('nombres_completos')">
+            {{ obtenerMensajeCampo('nombres_completos') }}
+          </small>
+        </label>
+
+        <label>
+          Cédula *
+          <input
+            type="text"
+            formControlName="cedula"
+            placeholder="Ingrese 10 números"
+            maxlength="10"
+            inputmode="numeric"
+            (keydown)="soloNumeros($event)"
+            (input)="limpiarSoloNumeros('cedula', 10)"
+          />
+
+          <small *ngIf="campoInvalido('cedula')">
+            {{ obtenerMensajeCampo('cedula') }}
+          </small>
+        </label>
+
+        <label>
+          Correo electrónico *
+          <input
+            type="email"
+            formControlName="correo_institucional"
+            placeholder="Ejemplo: usuario@inamhi.gob.ec usuario@gmail.com, usuario@outlook.com o "
+            maxlength="150"
+            autocomplete="email"
+            (input)="limpiarCorreoInstitucional()"
+          />
+
+          <small *ngIf="campoInvalido('correo_institucional')">
+            {{ obtenerMensajeCampo('correo_institucional') }}
+          </small>
+        </label>
+
+        <label>
+          Teléfono *
+          <input
+            type="text"
+            formControlName="telefono_ext"
+            placeholder="Ejemplo: 0991234567"
+            maxlength="10"
+            inputmode="numeric"
+            (keydown)="soloNumeros($event)"
+            (input)="limpiarSoloNumeros('telefono_ext', 10)"
+          />
+
+          <small *ngIf="campoInvalido('telefono_ext')">
+            {{ obtenerMensajeCampo('telefono_ext') }}
+          </small>
+        </label>
+
+        <!-- =====================================================
+             LISTAS DEPENDIENTES: DIRECCIÓN → ÁREA → CARGO
+        ====================================================== -->
+
+        <label>
+          Dirección / Dependencia *
+          <select
+            formControlName="direccion_id"
+            (change)="onDireccionSeleccionada()"
+          >
+            <option value="">Seleccione una dirección</option>
+
+            <option
+              *ngFor="let direccion of direcciones"
+              [value]="direccion.id"
+            >
+              {{ direccion.nombre }}
+            </option>
+          </select>
+
+          <small *ngIf="campoInvalido('direccion_id')">
+            {{ obtenerMensajeCampo('direccion_id') }}
+          </small>
+        </label>
+
+        <label>
+          Área / Unidad *
+          <select
+            formControlName="area_id"
+            (change)="onAreaSeleccionada()"
+          >
+            <option value="">Seleccione un área</option>
+
+            <option
+              *ngFor="let area of areas"
+              [value]="area.id"
+            >
+              {{ area.nombre }}
+            </option>
+          </select>
+
+          <small *ngIf="campoInvalido('area_id')">
+            {{ obtenerMensajeCampo('area_id') }}
+          </small>
+        </label>
+
+        <label>
+          Cargo *
+          <select
+            formControlName="cargo_id"
+            (change)="onCargoSeleccionado()"
+          >
+            <option value="">Seleccione un cargo</option>
+
+            <option
+              *ngFor="let cargo of cargos"
+              [value]="cargo.id"
+            >
+              {{ cargo.nombre }}
+            </option>
+          </select>
+
+          <small *ngIf="campoInvalido('cargo_id')">
+            {{ obtenerMensajeCampo('cargo_id') }}
+          </small>
+        </label>
+
+        <label>
+          Fecha de solicitud
+          <div class="fecha-hoy-display">
+            <i class="bi bi-calendar-check-fill"></i>
+            {{ fechaHoyTexto }}
+          </div>
+        </label>
+      </div>
+
+      <div class="assigned-chief-card" *ngIf="jefeAsignado">
+        <div>
+          <span>Jefe asignado automáticamente</span>
+          <strong>
+            {{ jefeAsignado.nombres }} {{ jefeAsignado.apellidos || '' }}
+          </strong>
+          <p>{{ jefeAsignado.cargo }}</p>
+        </div>
+
+        <small>
+          La solicitud será enviada únicamente al jefe responsable del área seleccionada.
+        </small>
+      </div>
+
+      <div class="assigned-chief-card warning" *ngIf="formulario.get('area_id')?.value && !jefeAsignado">
+        <div>
+          <span>Jefe no configurado</span>
+          <strong>No existe un jefe asignado para esta área.</strong>
+          <p>Comuníquese con TICS o con el administrador del sistema.</p>
+        </div>
+      </div>
+            <!-- =====================================================
+           SECCIÓN 2: INFORMACIÓN DE LA SOLICITUD
+      ====================================================== -->
+
+      <div class="section-title">
+        <span>2</span>
+
+        <div>
+          <h4>Información de la solicitud</h4>
+          <p>Detalle técnico, fecha de vigencia y justificación del acceso requerido.</p>
+        </div>
+      </div>
+
+      <div class="grid two">
+        <label>
+          Tipo de usuario *
+          <select formControlName="tipo_usuario">
+            <option value="funcionario_inamhi">
+              Funcionario INAMHI
+            </option>
+
+            <option value="externo">
+              Externo
+            </option>
+          </select>
+
+          <small *ngIf="campoInvalido('tipo_usuario')">
+            {{ obtenerMensajeCampo('tipo_usuario') }}
+          </small>
+        </label>
+
+        <label>
+          Fecha fin de vigencia del acceso *
+          <input
+            type="date"
+            formControlName="tiempo_vigencia_acceso"
+            [min]="formulario.get('fecha_solicitud')?.value"
+          />
+
+          <small *ngIf="campoInvalido('tiempo_vigencia_acceso')">
+            {{ obtenerMensajeCampo('tiempo_vigencia_acceso') }}
+          </small>
+        </label>
+
+        <label *ngIf="formulario.get('tipo_usuario')?.value === 'externo'">
+          Nombre del usuario externo *
+          <input
+            type="text"
+            formControlName="nombre_usuario_externo"
+            placeholder="Nombre completo del usuario externo"
+            maxlength="200"
+            (input)="limpiarTextoSimple('nombre_usuario_externo')"
+          />
+
+          <small *ngIf="campoInvalido('nombre_usuario_externo')">
+            {{ obtenerMensajeCampo('nombre_usuario_externo') }}
+          </small>
+        </label>
+
+        <div class="ip-field">
+          <label>
+            Dirección IP
+
+            <div class="ip-input-row">
+              <input
+                type="text"
+                formControlName="direccion_ip"
+                placeholder="Ejemplo: 192.168.1.100"
+                maxlength="15"
+                (input)="limpiarIp()"
+              />
+
+              <button
+                type="button"
+                class="ip-help-btn"
+                (click)="abrirModalIp()"
+                title="Ver tutorial para encontrar mi dirección IP"
+              >
+                ¿Cómo ver mi IP?
+              </button>
+            </div>
+
+            <small *ngIf="campoInvalido('direccion_ip')">
+              {{ obtenerMensajeCampo('direccion_ip') }}
+            </small>
+          </label>
+        </div>
+      </div>
+
+      <label class="full">
+        Justificación de la necesidad institucional *
+        <textarea
+          formControlName="justificacion_necesidad_institucional"
+          rows="5"
+          maxlength="2000"
+          placeholder="Explique de forma clara la necesidad institucional del acceso solicitado..."
+          (input)="limpiarTextoSimple('justificacion_necesidad_institucional')"
+        ></textarea>
+
+        <div class="counter">
+          {{ formulario.get('justificacion_necesidad_institucional')?.value?.length || 0 }}/2000
+        </div>
+
+        <small *ngIf="campoInvalido('justificacion_necesidad_institucional')">
+          {{ obtenerMensajeCampo('justificacion_necesidad_institucional') }}
+        </small>
+      </label>
+
+      <!-- =====================================================
+           SECCIÓN 3: PÁGINAS WEB
+      ====================================================== -->
+
+      <div class="section-title pages-title">
+        <span>3</span>
+
+        <div>
+          <h4>Páginas web importantes</h4>
+          <p>Ingrese mínimo 1 y máximo 8 páginas web. Deben iniciar con http:// o https://.</p>
+        </div>
+
+        <button
+          type="button"
+          class="add-btn"
+          (click)="agregarPaginaWeb()"
+          [disabled]="paginasWeb.length >= 8"
+        >
+          + Agregar página
+        </button>
+      </div>
+
+      <div formArrayName="paginas_web" class="pages-list">
+        <div
+          class="page-item"
+          *ngFor="let pagina of paginasWeb.controls; let i = index"
+          [formGroupName]="i"
+        >
+          <div class="page-number">
+            {{ i + 1 }}
+          </div>
+
+          <label>
+            URL *
+            <input
+              type="url"
+              formControlName="url_pagina"
+              placeholder="https://www.gob.ec"
+              maxlength="255"
+              (input)="limpiarUrlPagina(i)"
+            />
+
+            <small *ngIf="paginaInvalida(i, 'url_pagina')">
+              {{ obtenerMensajePagina(i, 'url_pagina') }}
+            </small>
+          </label>
+
+          <label>
+            Descripción
+            <input
+              type="text"
+              formControlName="descripcion"
+              placeholder="Descripción opcional"
+              maxlength="255"
+            />
+
+            <small *ngIf="paginaInvalida(i, 'descripcion')">
+              {{ obtenerMensajePagina(i, 'descripcion') }}
+            </small>
+          </label>
+
+          <button
+            type="button"
+            class="remove-btn"
+            (click)="eliminarPaginaWeb(i)"
+            [disabled]="paginasWeb.length <= 1"
+          >
+            Eliminar
+          </button>
+        </div>
+      </div>
+
+      <div class="error-general" *ngIf="errorGeneral">
+        {{ errorGeneral }}
+      </div>
+
+      <div class="actions">
+        <a routerLink="/" class="cancel-btn">
+          Cancelar
+        </a>
+
+        <button
+          type="button"
+          class="download-format-btn"
+          [disabled]="preparandoFirmaEc || cargando || !jefeAsignado"
+          (click)="abrirModalFirmaEc()"
+        >
+          Continuar con firma electrónica
+        </button>
+      </div>
+    </form>
+  </main>
+    <!-- =====================================================
+       MODAL FIRMAEC ASISTIDO
+  ====================================================== -->
+
+  <!-- =====================================================
+       MODAL FIRMA DIGITAL CON CERTIFICADO (.p12/.pfx)
+  ====================================================== -->
+  <div
+    class="modal-backdrop-firmaec"
+    *ngIf="mostrarModalFirmaEc"
+    role="dialog"
+    aria-modal="true"
+    (click)="cerrarModalFirmaEc()"
+  >
+    <section class="modal-firma-digital-pub" (click)="$event.stopPropagation()">
+
+      <!-- Encabezado -->
+      <div class="mfd-header">
+        <div class="mfd-icon">
+          <i class="bi bi-pen-fill"></i>
+        </div>
+        <div class="mfd-header-text">
+          <span>Firma electrónica institucional</span>
+          <h3>Firmar solicitud como solicitante</h3>
+          <p>Su firma digital se colocará automáticamente en el documento</p>
+        </div>
+        <button
+          type="button"
+          class="mfd-close"
+          (click)="cerrarModalFirmaEc()"
+          [disabled]="preparandoFirmaEc || firmandoDocumento || validandoCertificado"
+          aria-label="Cerrar"
+        >
+          <i class="bi bi-x-lg"></i>
+        </button>
+      </div>
+
+      <!-- Progreso -->
+      <div class="mfd-progress">
+        <div class="mfd-step" [class.active]="pasoFirma === 'preparando' || pasoFirma === 'cert' || pasoFirma === 'firmando' || pasoFirma === 'finalizado'">
+          <span class="mfd-step-num">1</span>
+          <p>Registrar solicitud</p>
+        </div>
+        <div class="mfd-line" [class.done]="pasoFirma === 'cert' || pasoFirma === 'firmando' || pasoFirma === 'finalizado'"></div>
+        <div class="mfd-step" [class.active]="pasoFirma === 'cert' || pasoFirma === 'firmando' || pasoFirma === 'finalizado'">
+          <span class="mfd-step-num">2</span>
+          <p>Certificado</p>
+        </div>
+        <div class="mfd-line" [class.done]="pasoFirma === 'firmando' || pasoFirma === 'finalizado'"></div>
+        <div class="mfd-step" [class.active]="pasoFirma === 'firmando' || pasoFirma === 'finalizado'">
+          <span class="mfd-step-num">3</span>
+          <p>Firmar</p>
+        </div>
+      </div>
+
+      <!-- ══ PASO 1: Preparando solicitud ══ -->
+      <div class="mfd-body" *ngIf="pasoFirma === 'preparando'">
+        <div class="mfd-loading">
+          <div class="mfd-spinner-lg"></div>
+          <p>Registrando solicitud en el sistema...</p>
+          <span>Por favor espere</span>
+        </div>
+        <div class="mfd-alert mfd-alert-error" *ngIf="errorCertificado">
+          <i class="bi bi-exclamation-triangle-fill"></i>
+          {{ errorCertificado }}
+        </div>
+      </div>
+
+      <!-- ══ PASO 2: Subir certificado ══ -->
+      <div class="mfd-body" *ngIf="pasoFirma === 'cert'">
+
+        <!-- Código generado -->
+        <div class="mfd-codigo" *ngIf="codigoFirmaEc">
+          <i class="bi bi-qr-code"></i>
+          <div>
+            <span>Código de solicitud</span>
+            <strong>{{ codigoFirmaEc }}</strong>
+          </div>
+        </div>
+
+        <!-- Info del proceso -->
+        <div class="mfd-info-row" *ngIf="jefeAsignado">
+          <div class="mfd-info-item">
+            <span>Firmante</span>
+            <strong>{{ formulario.get('nombres_completos')?.value || 'Solicitante' }}</strong>
+          </div>
+          <div class="mfd-info-item">
+            <span>Rol en el documento</span>
+            <strong>Solicitante</strong>
+          </div>
+          <div class="mfd-info-item">
+            <span>Jefe inmediato</span>
+            <strong>{{ jefeAsignado.nombres }} {{ jefeAsignado.apellidos || '' }}</strong>
+          </div>
+        </div>
+
+        <!-- Certificado -->
+        <div class="mfd-field">
+          <label class="mfd-label">
+            <i class="bi bi-file-earmark-lock2-fill"></i>
+            Certificado digital *
+          </label>
+          <label class="mfd-upload-zone" [class.has-file]="certificadoPublico">
+            <input
+              type="file"
+              accept=".p12,.pfx"
+              (change)="seleccionarCertificadoPublico($event)"
+              [disabled]="firmandoDocumento || validandoCertificado"
+            />
+            <i class="bi" [ngClass]="certificadoPublico ? 'bi-file-earmark-check-fill' : 'bi-cloud-arrow-up'"></i>
+            <strong>{{ nombreCertificadoPublico || 'Seleccionar certificado .p12 o .pfx' }}</strong>
+            <span>Solo .p12 o .pfx · Máximo 5 MB</span>
+          </label>
+        </div>
+
+        <!-- Contraseña -->
+        <div class="mfd-field">
+          <label class="mfd-label">
+            <i class="bi bi-lock-fill"></i>
+            Contraseña del certificado *
+          </label>
+          <div class="mfd-pass-wrap">
+            <input
+              [type]="mostrarPassword ? 'text' : 'password'"
+              class="mfd-input"
+              placeholder="Contraseña de su certificado"
+              [(ngModel)]="passwordCertificado"
+              [disabled]="firmandoDocumento || validandoCertificado"
+              autocomplete="current-password"
+            />
+            <button type="button" class="mfd-eye" (click)="toggleMostrarPassword()">
+              <i class="bi" [ngClass]="mostrarPassword ? 'bi-eye-slash-fill' : 'bi-eye-fill'"></i>
+            </button>
+          </div>
+          <p class="mfd-hint">La contraseña no se almacena ni se registra en el sistema.</p>
+        </div>
+
+        <!-- Observación -->
+        <div class="mfd-field">
+          <label class="mfd-label">
+            <i class="bi bi-chat-left-text"></i>
+            Observación (opcional)
+          </label>
+          <textarea
+            class="mfd-textarea"
+            rows="2"
+            maxlength="500"
+            placeholder="Observación sobre esta firma..."
+            [(ngModel)]="observacionFirma"
+            [disabled]="firmandoDocumento"
+          ></textarea>
+        </div>
+
+        <!-- Error -->
+        <div class="mfd-alert mfd-alert-error" *ngIf="errorCertificado">
+          <i class="bi bi-exclamation-triangle-fill"></i>
+          {{ errorCertificado }}
+        </div>
+
+        <!-- Info certificado validado -->
+        <div class="mfd-cert-info" *ngIf="infoCertificado && certificadoValidado">
+          <div class="mfd-cert-ok">
+            <i class="bi bi-patch-check-fill"></i>
+            Certificado verificado
+            <span class="mfd-cert-badge">
+              {{ infoCertificado.vigente ? 'Vigente — ' + infoCertificado.dias_restantes + ' días' : 'EXPIRADO' }}
+            </span>
+          </div>
+          <table class="mfd-cert-table">
+            <tr><td>Titular</td><td>{{ infoCertificado.subject_cn }}</td></tr>
+            <tr><td>Emisor</td><td>{{ infoCertificado.issuer_cn }}</td></tr>
+            <tr><td>Serie</td><td class="mono">{{ infoCertificado.numero_serie }}</td></tr>
+            <tr><td>Válido hasta</td><td>{{ infoCertificado.fecha_expiracion }}</td></tr>
+          </table>
+        </div>
+
+        <!-- Acciones -->
+        <div class="mfd-actions">
+          <button
+            type="button"
+            class="mfd-btn-secondary"
+            (click)="cerrarModalFirmaEc()"
+            [disabled]="firmandoDocumento || validandoCertificado"
+          >
+            Cancelar
+          </button>
+
+          <button
+            type="button"
+            class="mfd-btn-outline"
+            (click)="validarCertificadoPublico()"
+            [disabled]="!certificadoPublico || !passwordCertificado || validandoCertificado || firmandoDocumento"
+          >
+            <span *ngIf="!validandoCertificado">
+              <i class="bi bi-shield-check"></i> Verificar certificado
+            </span>
+            <span *ngIf="validandoCertificado" class="mfd-loading-inline">
+              <span class="mfd-spinner-sm"></span> Verificando...
+            </span>
+          </button>
+
+          <button
+            type="button"
+            class="mfd-btn-primary"
+            (click)="firmarComoSolicitante()"
+            [disabled]="!certificadoPublico || !passwordCertificado || firmandoDocumento || validandoCertificado"
+          >
+            <span *ngIf="!firmandoDocumento">
+              <i class="bi bi-pen-fill"></i> Firmar electrónicamente
+            </span>
+            <span *ngIf="firmandoDocumento" class="mfd-loading-inline">
+              <span class="mfd-spinner-sm"></span> Firmando documento...
+            </span>
+          </button>
+        </div>
+      </div>
+
+      <!-- ══ PASO 3: Firmando ══ -->
+      <div class="mfd-body" *ngIf="pasoFirma === 'firmando'">
+        <div class="mfd-loading">
+          <div class="mfd-spinner-lg signing"></div>
+          <p>Aplicando firma digital criptográfica...</p>
+          <span>El sistema está firmando su documento en la columna SOLICITANTE</span>
+        </div>
+      </div>
+
+    </section>
+  </div>
+
+  <!-- =====================================================
+       MODAL TUTORIAL PARA DIRECCIÓN IP
+  ====================================================== -->
+
+  <div class="modal-backdrop-ip" *ngIf="mostrarModalIp">
+    <section class="modal-ip-card">
+      <button
+        type="button"
+        class="close-modal-ip"
+        (click)="cerrarModalIp()"
+        aria-label="Cerrar tutorial de IP"
+      >
+        ×
+      </button>
+
+      <div class="modal-ip-header">
+        <div class="modal-ip-icon">
+          <i class="bi bi-router-fill"></i>
+        </div>
+
+        <div>
+          <span>Guía rápida</span>
+
+          <h3>¿Cómo encontrar mi dirección IP?</h3>
+
+          <p>
+            La dirección IP identifica el equipo o red desde donde se solicita el acceso.
+            Este dato ayuda al área técnica a revisar la solicitud correctamente.
+          </p>
+        </div>
+      </div>
+
+      <div class="ip-explanation-box">
+        <h4>¿Qué es una dirección IP?</h4>
+
+        <p>
+          Una dirección IP es un número que identifica un dispositivo dentro de una red.
+          Un ejemplo común es <strong>192.168.1.100</strong>. En este formulario se solicita
+          para que TICS pueda validar desde qué equipo o red se requiere el acceso.
+        </p>
+      </div>
+
+      <div class="tutorial-grid">
+        <article class="tutorial-card">
+          <span>Opción 1</span>
+
+          <h4>Ver IP usando comandos de Windows</h4>
+
+          <ol>
+            <li>Presione las teclas <strong>Windows + R</strong>.</li>
+            <li>Escriba <strong>cmd</strong> y presione <strong>Enter</strong>.</li>
+            <li>En la ventana negra escriba <strong>ipconfig</strong>.</li>
+            <li>Presione <strong>Enter</strong>.</li>
+            <li>Busque el dato llamado <strong>Dirección IPv4</strong>.</li>
+            <li>Copie ese número en el campo <strong>Dirección IP</strong> del formulario.</li>
+          </ol>
+        </article>
+
+        <article class="tutorial-card">
+          <span>Opción 2</span>
+
+          <h4>Ver IP desde Configuración</h4>
+
+          <ol>
+            <li>Abra la <strong>Configuración</strong> de Windows.</li>
+            <li>Ingrese a <strong>Red e Internet</strong>.</li>
+            <li>Seleccione <strong>Wi-Fi</strong> o <strong>Ethernet</strong>, según su conexión.</li>
+            <li>Abra las <strong>Propiedades</strong> de la red conectada.</li>
+            <li>Busque el campo <strong>Dirección IPv4</strong>.</li>
+            <li>Copie ese número en el formulario.</li>
+          </ol>
+        </article>
+      </div>
+
+      <div class="ip-note">
+        <strong>Importante:</strong>
+        Si no conoce este dato, puede solicitar apoyo al área de TICS.
+      </div>
+
+      <div class="modal-ip-actions">
+        <button type="button" (click)="cerrarModalIp()">
+          Entendido
+        </button>
+      </div>
+    </section>
+  </div>
+</section>
+
+<div class="toast-enviado" *ngIf="mostrarToastEnviado">
+  <span class="toast-enviado-icon">✓</span>
+  Documento enviado al jefe inmediato
+</div>
+
+<!-- =====================================================
+     MODAL CONFIRMACIÓN DE ENVÍO
+====================================================== -->
+<div class="modal-backdrop-confirm" *ngIf="mostrarConfirmEnvio">
+  <div class="modal-confirm-card">
+
+    <div class="confirm-icon-wrap">
+      <span class="confirm-icon-inner">!</span>
+    </div>
+
+    <h3 class="confirm-title">Confirmar envío</h3>
+
+   
+    <p class="confirm-body">
+      Al enviarlo, la solicitud pasará únicamente al jefe responsable del
+      área seleccionada.
+    </p>
+
+    <div class="confirm-actions">
+      <button
+        type="button"
+        class="confirm-cancel-btn"
+        (click)="cancelarConfirmEnvio()"
+        [disabled]="subiendoFirmaEc"
+      >
+        Cancelar
+      </button>
+      <button
+        type="button"
+        class="confirm-ok-btn"
+        (click)="confirmarEnvioFirmaEc()"
+        [disabled]="subiendoFirmaEc"
+      >
+        <span *ngIf="!subiendoFirmaEc">Confirmar envío</span>
+        <span *ngIf="subiendoFirmaEc">Enviando...</span>
+      </button>
+    </div>
+
+  </div>
+
+@if (mostrarVisorPdf) {
+  <app-pdf-viewer
+    [url]="urlVisorPdf"
+    [titulo]="tituloVisorPdf"
+    (cerrar)="cerrarVisorPdf()"
+  />
+}
+</div>

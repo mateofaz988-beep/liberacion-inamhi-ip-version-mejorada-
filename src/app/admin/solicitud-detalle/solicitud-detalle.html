@@ -1,0 +1,1150 @@
+<section class="detail-page">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo-box">
+        <i [class]="getIconoRol()"></i>
+      </div>
+
+      <div>
+        <h2>INAMHI</h2>
+        <span>{{ getTituloRol() }}</span>
+      </div>
+    </div>
+
+    <nav class="menu">
+      <!-- ADMIN -->
+      <ng-container *ngIf="esAdmin()">
+        <a routerLink="/admin/dashboard" routerLinkActive="active"
+           [routerLinkActiveOptions]="{ exact: true }">Dashboard</a>
+        <a routerLink="/admin/solicitudes" routerLinkActive="active">Solicitudes</a>
+        <a routerLink="/admin/usuarios" routerLinkActive="active">Usuarios</a>
+        <a routerLink="/admin/funcionarios" routerLinkActive="active">Funcionarios</a>
+        <a routerLink="/admin/reportes" routerLinkActive="active">Reportes</a>
+        <a routerLink="/admin/auditoria" routerLinkActive="active">Auditoría</a>
+      </ng-container>
+
+      <!-- JEFE INMEDIATO -->
+      <ng-container *ngIf="esJefe()">
+        <a routerLink="/jefe/dashboard" routerLinkActive="active"
+           [routerLinkActiveOptions]="{ exact: true }">Dashboard</a>
+        <a routerLink="/jefe/historial" routerLinkActive="active">Historial</a>
+        <a routerLink="/jefe/reportes" routerLinkActive="active">Reportes</a>
+      </ng-container>
+
+      <!-- MÁXIMA AUTORIDAD -->
+      <ng-container *ngIf="esAutoridad()">
+        <a routerLink="/autoridad/dashboard" routerLinkActive="active"
+           [routerLinkActiveOptions]="{ exact: true }">Dashboard</a>
+        <a routerLink="/autoridad/historial" routerLinkActive="active">Historial</a>
+        <a routerLink="/autoridad/reportes" routerLinkActive="active">Reportes</a>
+      </ng-container>
+
+      <!-- TICS -->
+      <ng-container *ngIf="esTics()">
+        <a routerLink="/tics/dashboard" routerLinkActive="active"
+           [routerLinkActiveOptions]="{ exact: true }">Dashboard</a>
+        <a routerLink="/tics/historial" routerLinkActive="active">Historial</a>
+        <a routerLink="/tics/reportes" routerLinkActive="active">Reportes</a>
+      </ng-container>
+    </nav>
+
+    <button type="button" class="logout" (click)="logout()">
+      <i class="bi bi-box-arrow-right"></i>
+      Cerrar sesión
+    </button>
+  </aside>
+
+  <main class="content">
+    <header class="topbar">
+      <div>
+        <span class="eyebrow">Detalle de solicitud</span>
+        <h1>Revisión del proceso electrónico</h1>
+
+        <p>
+          Consulte la información completa, revise documentos cargados y continúe
+          el flujo mediante firma electrónica con FirmaEC.
+        </p>
+      </div>
+
+      <div class="user-actions">
+        <a
+          class="back-btn"
+          [routerLink]="getRutaVolver()"
+        >
+          <i class="bi bi-arrow-left"></i>
+          Volver
+        </a>
+
+        <button
+          type="button"
+          class="refresh-btn"
+          (click)="cargarDetalle()"
+          [disabled]="cargando || procesando"
+        >
+          <i class="bi bi-arrow-clockwise"></i>
+          Actualizar
+        </button>
+
+        <button
+          type="button"
+          class="logout-top-btn"
+          (click)="logout()"
+        >
+          <i class="bi bi-box-arrow-right"></i>
+          Cerrar sesión
+        </button>
+      </div>
+    </header>
+
+    <div class="loading" *ngIf="cargando" aria-live="polite" aria-busy="true">
+      Cargando detalle de solicitud...
+    </div>
+
+    <div class="error-box" *ngIf="error" role="alert" aria-live="assertive">
+      {{ error }}
+    </div>
+
+    <div class="ok-box" *ngIf="mensajeOk" role="status" aria-live="polite">
+      {{ mensajeOk }}
+    </div>
+
+    <ng-container *ngIf="!cargando && solicitud">
+      <!-- =====================================================
+           ENCABEZADO DEL DETALLE
+      ====================================================== -->
+
+      <section class="hero-card">
+        <div>
+          <span class="label">Código de solicitud</span>
+
+          <h2>{{ solicitud.codigo_solicitud }}</h2>
+
+          <p>
+            {{ solicitud.nombres_completos }} ·
+            {{ solicitud.correo_institucional }}
+          </p>
+        </div>
+
+        <div class="status-group">
+          <span
+            class="status"
+            [ngClass]="getEstadoClase(solicitud.estado)"
+          >
+            {{ getEstadoTexto(solicitud.estado) }}
+          </span>
+
+          <span class="stage">
+            {{ getEtapaTexto(solicitud.etapa_actual) }}
+          </span>
+        </div>
+      </section>
+
+      <!-- =====================================================
+           GUÍA DEL PROCESO
+      ====================================================== -->
+
+      <div class="process-guide" *ngIf="!esAdmin() && !estaFinalizada()">
+        <div class="process-step">
+          <div class="process-step-num">1</div>
+          <div class="process-step-body">
+            <strong>Descargar</strong>
+            <span>Descargue el PDF firmado actual desde la sección de acciones.</span>
+          </div>
+        </div>
+        <div class="process-step-arrow">→</div>
+        <div class="process-step">
+          <div class="process-step-num">2</div>
+          <div class="process-step-body">
+            <strong>Firmar con FirmaEC</strong>
+            <span>Abra el PDF en la aplicación FirmaEC de su equipo y fírmelo electrónicamente.</span>
+          </div>
+        </div>
+        <div class="process-step-arrow">→</div>
+        <div class="process-step">
+          <div class="process-step-num">3</div>
+          <div class="process-step-body">
+            <strong>Subir</strong>
+            <span>Suba el PDF firmado para avanzar con el proceso.</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- =====================================================
+           AVISO ADMIN REVISOR
+      ====================================================== -->
+
+      <section
+        class="actions-card admin-review-card"
+        *ngIf="esAdmin()"
+      >
+        <div>
+          <h3>Vista de revisión administrativa</h3>
+
+          <p>
+            El administrador puede revisar datos, estado, etapa actual y documentos
+            cargados. No puede aprobar, rechazar, subir documentos ni finalizar
+            procesos.
+          </p>
+        </div>
+
+        <div class="completed-badge">
+          <i class="bi bi-eye-fill"></i>
+          Solo revisión
+        </div>
+      </section>
+
+      <!-- =====================================================
+           ACCIONES DEL FLUJO ELECTRÓNICO
+      ====================================================== -->
+
+      <section
+        class="panel-section"
+        *ngIf="!estaFinalizada() && !esAdmin()"
+      >
+        <div class="section-heading">
+          <div>
+            <span>Firma electrónica</span>
+            <h3>Acciones del flujo</h3>
+          </div>
+          <i class="bi bi-shield-lock-fill"></i>
+        </div>
+
+        <div class="documents-grid">
+
+          <!-- Ver / Descargar PDF firmado actual -->
+          <div class="document-card">
+            <div class="document-icon">
+              <i class="bi bi-file-earmark-pdf-fill"></i>
+            </div>
+            <div class="document-info">
+              <span>Paso 1 — Revisar documento</span>
+              <h4>PDF firmado actual</h4>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button
+                type="button"
+                class="document-download-btn"
+                style="background:linear-gradient(135deg,#334155,#0f172a)"
+                (click)="verDocumentoActual()"
+                [disabled]="procesando"
+              >
+                <i class="bi bi-eye-fill"></i>
+                Ver
+              </button>
+              <button
+                type="button"
+                class="document-download-btn"
+                (click)="descargarDocumentoFirmadoActual()"
+                [disabled]="procesando"
+              >
+                <i class="bi bi-download"></i>
+                Descargar
+              </button>
+            </div>
+          </div>
+
+          <!-- Firmar electrónicamente (nuevo modal dual) -->
+          <div class="document-card firma-digital-card">
+            <div class="document-icon action-firma-icon">
+              <i class="bi bi-pen-fill"></i>
+            </div>
+            <div class="document-info">
+              <span>Paso 2 — Firma digital</span>
+              <h4>Firmar electrónicamente</h4>
+              <p class="card-desc">pyHanko (.p12/.pfx) o FirmaEC</p>
+            </div>
+            <button
+              type="button"
+              class="document-download-btn action-firma-btn"
+              (click)="abrirModalFirmaDigital()"
+              [disabled]="procesando || estaFinalizada() || yaFirmoEsteRol"
+            >
+              <i class="bi bi-pen-fill"></i>
+              {{ yaFirmoEsteRol ? 'Ya firmado' : 'Firmar' }}
+            </button>
+          </div>
+
+        </div>
+
+        <!-- Estados de advertencia y éxito -->
+        <div class="document-warning" *ngIf="esJefe() && !jefeHaSubidoDocumento">
+          <i class="bi bi-exclamation-triangle-fill"></i>
+          Debe subir el PDF firmado con FirmaEC. La solicitud pasará automáticamente a Máxima Autoridad.
+        </div>
+
+        <div class="document-warning" *ngIf="esAutoridad() && !autoridadHaSubidoDocumento">
+          <i class="bi bi-exclamation-triangle-fill"></i>
+          Suba el PDF firmado antes de aprobar.
+        </div>
+
+        <div class="document-warning" *ngIf="esTics() && solicitud.estado === 'pendiente_tics' && !ticsHaSubidoDocumento">
+          <i class="bi bi-exclamation-triangle-fill"></i>
+          Suba el PDF firmado antes de aprobar la validación.
+        </div>
+
+        <div class="document-success" *ngIf="esJefe() && jefeHaSubidoDocumento">
+          <i class="bi bi-check-circle-fill"></i>
+          PDF registrado. La solicitud fue enviada automáticamente a Máxima Autoridad.
+        </div>
+
+        <div class="document-success" *ngIf="esAutoridad() && autoridadHaSubidoDocumento">
+          <i class="bi bi-check-circle-fill"></i>
+          PDF registrado. Ya puede aprobar para enviar a TICS.
+        </div>
+
+        <div class="document-success" *ngIf="esTics() && solicitud.estado === 'pendiente_tics' && ticsHaSubidoDocumento">
+          <i class="bi bi-check-circle-fill"></i>
+          PDF registrado. Ya puede aprobar la validación TICS.
+        </div>
+
+        <div class="document-success" *ngIf="esTics() && solicitud.estado === 'pendiente_ejecucion_tics'">
+          <i class="bi bi-check-circle-fill"></i>
+          Validación TICS aprobada. Ejecute la activación técnica y finalice el proceso.
+        </div>
+      </section>
+
+      <!-- =====================================================
+           ACCIONES DE APROBACIÓN / RECHAZO
+      ====================================================== -->
+
+      <section
+        class="decision-card"
+        *ngIf="!estaFinalizada() && !esAdmin()"
+      >
+        <div>
+          <h3>Decisión del proceso</h3>
+
+          <p>
+            Revise la solicitud y el documento firmado antes de ejecutar una acción.
+          </p>
+        </div>
+
+        <div class="decision-actions">
+
+          <!-- Jefe/Autoridad: aparece solo cuando el rol ya subió su propio PDF -->
+          <button
+            type="button"
+            class="approve-btn"
+            *ngIf="puedeAprobar()"
+            (click)="confirmarAprobacion()"
+            [disabled]="procesando"
+          >
+            <i class="bi bi-check-circle-fill"></i>
+            {{ getTextoBotonAprobar() }}
+          </button>
+
+          <!-- TICS: botón único que valida + finaliza en un paso -->
+          <button
+            type="button"
+            class="approve-btn final"
+            *ngIf="puedeAprobarValidacionTics()"
+            (click)="confirmarAprobacionTics()"
+            [disabled]="procesando"
+          >
+            <i class="bi bi-check2-circle"></i>
+            Aprobar y finalizar proceso TICS
+          </button>
+
+          <!-- TICS: fallback si el primer paso ya ocurrió pero no el segundo -->
+          <button
+            type="button"
+            class="approve-btn final"
+            *ngIf="puedeFinalizarTics()"
+            (click)="confirmarFinalizacionTics()"
+            [disabled]="procesando"
+          >
+            <i class="bi bi-check2-circle"></i>
+            Finalizar proceso TICS
+          </button>
+
+          <button
+            type="button"
+            class="reject-btn"
+            *ngIf="puedeRechazar()"
+            (click)="abrirModalRechazo()"
+            [disabled]="procesando"
+          >
+            <i class="bi bi-x-circle-fill"></i>
+            Rechazar solicitud
+          </button>
+        </div>
+      </section>
+            <!-- =====================================================
+           INFORMACIÓN PRINCIPAL DE LA SOLICITUD
+      ====================================================== -->
+
+      <div class="collapsible-block">
+        <button
+          type="button"
+          class="collapsible-toggle"
+          (click)="seccionDatosVisible = !seccionDatosVisible"
+        >
+          <div class="collapsible-toggle-left">
+            <i class="bi bi-info-circle-fill"></i>
+            <div>
+              <span>Datos de la solicitud</span>
+              <p>Solicitante, institución, acceso y estado del proceso.</p>
+            </div>
+          </div>
+          <i class="bi collapsible-chevron" [ngClass]="seccionDatosVisible ? 'bi-chevron-up' : 'bi-chevron-down'"></i>
+        </button>
+
+        <section class="detail-grid" *ngIf="seccionDatosVisible">
+        <article class="info-panel">
+          <div class="panel-title">
+            <i class="bi bi-building-fill"></i>
+
+            <div>
+              <h3>Datos institucionales</h3>
+              <p>Cédula, dependencia, área y cargo del solicitante.</p>
+            </div>
+          </div>
+
+          <div class="info-list">
+            <div>
+              <span>Cédula</span>
+              <strong>{{ solicitud.cedula }}</strong>
+            </div>
+
+            <div>
+              <span>Dependencia</span>
+              <strong>{{ solicitud.dependencia }}</strong>
+            </div>
+
+            <div>
+              <span>Área / Unidad</span>
+              <strong>{{ solicitud.area_unidad }}</strong>
+            </div>
+
+            <div>
+              <span>Cargo</span>
+              <strong>{{ solicitud.cargo }}</strong>
+            </div>
+
+            <div>
+              <span>Fecha de solicitud</span>
+              <strong>{{ formatearFecha(solicitud.fecha_solicitud) }}</strong>
+            </div>
+          </div>
+        </article>
+
+        <article class="info-panel">
+          <div class="panel-title">
+            <i class="bi bi-router-fill"></i>
+
+            <div>
+              <h3>Información del acceso</h3>
+              <p>Tipo de usuario y vigencia del acceso solicitado.</p>
+            </div>
+          </div>
+
+          <div class="info-list">
+            <div>
+              <span>Tipo de usuario</span>
+              <strong>{{ solicitud.tipo_usuario }}</strong>
+            </div>
+
+            <div>
+              <span>Vigencia del acceso</span>
+              <strong>{{ calcularVigencia(solicitud.tiempo_vigencia_acceso) }}</strong>
+            </div>
+          </div>
+        </article>
+
+        </section>
+      </div>
+
+      <!-- =====================================================
+           JUSTIFICACIÓN
+      ====================================================== -->
+
+      <div class="collapsible-block">
+        <button
+          type="button"
+          class="collapsible-toggle"
+          (click)="seccionJustificacionVisible = !seccionJustificacionVisible"
+        >
+          <div class="collapsible-toggle-left">
+            <i class="bi bi-card-text"></i>
+            <div>
+              <span>Justificación</span>
+              <p>Necesidad institucional declarada por el solicitante.</p>
+            </div>
+          </div>
+          <i class="bi collapsible-chevron" [ngClass]="seccionJustificacionVisible ? 'bi-chevron-up' : 'bi-chevron-down'"></i>
+        </button>
+
+        <section class="panel-section collapsible-body" *ngIf="seccionJustificacionVisible">
+          <div class="justification-box">
+            {{ solicitud.justificacion_necesidad_institucional || 'No se registró justificación.' }}
+          </div>
+        </section>
+      </div>
+
+      <!-- =====================================================
+           PÁGINAS WEB SOLICITADAS
+      ====================================================== -->
+
+      <section class="panel-section">
+        <div class="section-heading">
+          <div>
+            <span>Accesos solicitados</span>
+            <h3>Páginas web registradas</h3>
+          </div>
+
+          <i class="bi bi-globe2"></i>
+        </div>
+
+        <div class="table-wrapper">
+          <table>
+            <thead>
+              <tr>
+                <th>N°</th>
+                <th>URL / Página web</th>
+                <th>Descripción</th>
+              </tr>
+            </thead>
+
+            <tbody>
+              <tr *ngFor="let pagina of paginasWeb; let i = index; trackBy: trackByPagina">
+                <td>{{ pagina.numero || i + 1 }}</td>
+
+                <td>
+                  <a
+                    [href]="pagina.url_pagina"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="url-link"
+                  >
+                    {{ pagina.url_pagina }}
+                  </a>
+                </td>
+
+                <td>
+                  {{ pagina.descripcion || 'Sin descripción' }}
+                </td>
+              </tr>
+
+              <tr *ngIf="paginasWeb.length === 0">
+                <td colspan="3" class="empty">
+                  No existen páginas web registradas.
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      
+      <!-- =====================================================
+           MODAL FIRMA ELECTRÓNICA FIRMAEC
+      ====================================================== -->
+
+      <div
+        class="modal-backdrop-firmaec"
+        *ngIf="mostrarModalFirmaElectronica"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="modal-firmaec-titulo"
+      >
+        <section class="modal-firmaec-card">
+          <button
+            type="button"
+            class="close-modal-firmaec"
+            (click)="cerrarModalFirmaElectronica()"
+            [disabled]="procesando"
+            aria-label="Cerrar modal FirmaEC"
+          >
+            ×
+          </button>
+
+          <div class="firmaec-modal-header">
+            <div class="firmaec-modal-icon">
+              <i class="bi bi-shield-lock-fill"></i>
+            </div>
+
+            <div>
+              <span>Firma electrónica</span>
+              <h3 id="modal-firmaec-titulo">Subir PDF firmado</h3>
+              <p>Seleccione el PDF que firmó electrónicamente con FirmaEC.</p>
+            </div>
+          </div>
+
+          <label class="firmaec-upload-zone">
+            <input
+              type="file"
+              accept=".pdf,application/pdf"
+              [disabled]="procesando"
+              (change)="seleccionarArchivoFirmadoElectronico($event)"
+            />
+
+            <i class="bi bi-cloud-arrow-up-fill"></i>
+
+            <strong>
+              {{ nombreArchivoFirmadoElectronico || 'Seleccionar PDF firmado electrónicamente' }}
+            </strong>
+
+            <span>Solo PDF · Máximo 15 MB</span>
+          </label>
+
+          <div
+            class="preview-actions"
+            *ngIf="archivoFirmadoElectronico"
+          >
+            <button
+              type="button"
+              class="preview-btn"
+              (click)="verPdfFirmadoElectronico()"
+              [disabled]="procesando"
+            >
+              <i class="bi bi-eye-fill"></i>
+              Ver PDF seleccionado
+            </button>
+
+            <button
+              type="button"
+              class="remove-selected-btn"
+              (click)="quitarPdfFirmadoElectronico()"
+              [disabled]="procesando"
+            >
+              <i class="bi bi-trash-fill"></i>
+              Quitar PDF
+            </button>
+          </div>
+
+          <div
+            class="firmaec-error"
+            *ngIf="error"
+          >
+            {{ error }}
+          </div>
+
+          <div
+            class="firmaec-success"
+            *ngIf="mensajeOk"
+          >
+            {{ mensajeOk }}
+          </div>
+
+          <div class="firmaec-final-actions">
+            <button
+              type="button"
+              class="cancel-modal-btn"
+              (click)="cerrarModalFirmaElectronica()"
+              [disabled]="procesando"
+            >
+              Cancelar
+            </button>
+
+            <button
+              type="button"
+              class="send-firmaec-btn"
+              (click)="subirFirmaElectronica()"
+              [disabled]="procesando || !archivoFirmadoElectronico"
+            >
+              <span *ngIf="!procesando">
+                <i class="bi bi-send-check-fill"></i>
+                Enviar PDF firmado
+              </span>
+
+              <span *ngIf="procesando">
+                Enviando PDF firmado...
+              </span>
+            </button>
+          </div>
+        </section>
+      </div>
+
+      <!-- =====================================================
+           MODAL FIRMA DIGITAL — DUAL MODE (pyHanko / FirmaEC)
+      ====================================================== -->
+
+      <div
+        class="modal-backdrop-firma-digital"
+        *ngIf="mostrarModalFirmaDigital"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="modal-firma-digital-titulo"
+        (click)="cerrarModalFirmaDigital()"
+      >
+        <section class="modal-firma-digital-card" (click)="$event.stopPropagation()">
+
+          <!-- Encabezado -->
+          <div class="fd-header">
+            <div class="fd-header-left">
+              <div class="fd-icon">
+                <i class="bi bi-pen-fill"></i>
+              </div>
+              <div>
+                <span class="fd-eyebrow">Firma electrónica institucional</span>
+                <h3 id="modal-firma-digital-titulo">Firmar documento</h3>
+                <p>{{ solicitud?.codigo_solicitud }} · {{ solicitud?.nombres_completos }}</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              class="fd-close"
+              (click)="cerrarModalFirmaDigital()"
+              [disabled]="validandoCertificado || firmandoConCertificado"
+              aria-label="Cerrar"
+            >
+              <i class="bi bi-x-lg"></i>
+            </button>
+          </div>
+
+          <!-- Selector de modo -->
+          <div class="fd-mode-tabs">
+            <button
+              type="button"
+              class="fd-mode-tab"
+              [class.active]="modoFirma === 'pyhanko'"
+              (click)="cambiarModoFirma('pyhanko')"
+              [disabled]="validandoCertificado || firmandoConCertificado"
+            >
+              <i class="bi bi-key-fill"></i>
+              Certificado .p12/.pfx
+              <span class="fd-mode-badge">Recomendado</span>
+            </button>
+            <button
+              type="button"
+              class="fd-mode-tab"
+              [class.active]="modoFirma === 'firmaec'"
+              (click)="cambiarModoFirma('firmaec')"
+              [disabled]="validandoCertificado || firmandoConCertificado"
+            >
+              <i class="bi bi-cloud-arrow-up-fill"></i>
+              FirmaEC (subir PDF)
+            </button>
+          </div>
+
+          <!-- ══════════════════════════════════════
+               MODO 1 — pyHanko (.p12/.pfx)
+          ══════════════════════════════════════ -->
+          @if (modoFirma === 'pyhanko') {
+          <div class="fd-body">
+
+            <!-- YA FIRMÓ ESTE ROL -->
+            @if (yaFirmoEsteRol && !firmaExitosa) {
+              <div class="fd-alert fd-alert-success">
+                <i class="bi bi-patch-check-fill"></i>
+                Ya registró su firma digital en esta solicitud.
+              </div>
+              <div class="fd-actions">
+                <button type="button" class="fd-btn-secondary" (click)="cerrarModalFirmaDigital()">Cerrar</button>
+                <button type="button" class="fd-btn-primary" (click)="verPdfFirmadoTrasExito()" [disabled]="procesando">
+                  <i class="bi bi-eye-fill"></i> Ver documento firmado
+                </button>
+              </div>
+            }
+
+            <!-- PANEL ÉXITO POST-FIRMA -->
+            @if (firmaExitosa) {
+              <div class="fd-firma-ok">
+                <div class="fd-firma-ok-icon">
+                  <i class="bi bi-patch-check-fill"></i>
+                </div>
+                <h3>Documento firmado correctamente</h3>
+                <p>La firma digital fue aplicada en la columna <strong>{{ getMiRolTexto() }}</strong> del PDF.</p>
+
+                @if (resultadoFirma?.certificado) {
+                  <div class="fd-cert-info" style="margin-top:14px;text-align:left">
+                    <div class="fd-cert-header">
+                      <i class="bi bi-shield-fill-check"></i>
+                      Certificado utilizado
+                    </div>
+                    <table class="fd-cert-table">
+                      <tr><td>Titular</td><td>{{ resultadoFirma.certificado.subject_cn }}</td></tr>
+                      <tr><td>Emisor</td><td>{{ resultadoFirma.certificado.issuer_cn }}</td></tr>
+                      <tr><td>Serie</td><td class="mono">{{ resultadoFirma.certificado.numero_serie }}</td></tr>
+                    </table>
+                  </div>
+                }
+
+                <div class="fd-actions" style="margin-top:18px">
+                  <button type="button" class="fd-btn-secondary" (click)="cerrarModalFirmaDigital()">
+                    Cerrar
+                  </button>
+                  <button type="button" class="fd-btn-primary" (click)="verPdfFirmadoTrasExito()" [disabled]="procesando">
+                    <i class="bi bi-eye-fill"></i>
+                    Ver documento con firma
+                  </button>
+                </div>
+              </div>
+            }
+
+            <!-- FORMULARIO DE FIRMA -->
+            @if (!yaFirmoEsteRol && !firmaExitosa) {
+
+              <!-- Stepper -->
+              <div class="fd-stepper">
+                <div class="fd-step" [class.active]="pasoFirma >= 1" [class.done]="pasoFirma > 1">
+                  <div class="fd-step-num">
+                    @if (pasoFirma > 1) { <i class="bi bi-check-lg"></i> } @else { 1 }
+                  </div>
+                  <span>Certificado</span>
+                </div>
+                <div class="fd-step-line" [class.done]="pasoFirma > 1"></div>
+                <div class="fd-step" [class.active]="pasoFirma >= 2" [class.done]="pasoFirma > 2">
+                  <div class="fd-step-num">
+                    @if (pasoFirma > 2) { <i class="bi bi-check-lg"></i> } @else { 2 }
+                  </div>
+                  <span>Contraseña</span>
+                </div>
+                <div class="fd-step-line" [class.done]="pasoFirma > 2"></div>
+                <div class="fd-step" [class.active]="pasoFirma >= 3">
+                  <div class="fd-step-num">3</div>
+                  <span>Firmar</span>
+                </div>
+              </div>
+
+              <!-- Info rol + etapa -->
+              <div class="fd-info-row">
+                <div class="fd-info-item">
+                  <span>Rol</span>
+                  <strong>{{ getMiRolTexto() }}</strong>
+                </div>
+                <div class="fd-info-item">
+                  <span>Etapa</span>
+                  <strong>{{ getEtapaTexto(solicitud?.etapa_actual || '') }}</strong>
+                </div>
+                <div class="fd-info-item">
+                  <span>Solicitud</span>
+                  <strong>{{ solicitud?.codigo_solicitud }}</strong>
+                </div>
+              </div>
+
+              <!-- PASO 1: Certificado -->
+              <div class="fd-field">
+                <label class="fd-label">
+                  <i class="bi bi-file-earmark-lock2-fill"></i>
+                  Certificado digital (.p12 / .pfx) *
+                </label>
+                <label class="fd-upload-zone" [class.has-file]="certificadoSeleccionado">
+                  <input
+                    type="file"
+                    accept=".p12,.pfx"
+                    (change)="seleccionarCertificado($event)"
+                    [disabled]="firmandoConCertificado"
+                  />
+                  <i class="bi" [ngClass]="certificadoSeleccionado ? 'bi-file-earmark-check-fill' : 'bi-cloud-arrow-up'"></i>
+                  <strong>{{ nombreCertificado || 'Seleccionar archivo .p12 o .pfx' }}</strong>
+                  <span>Solo .p12 o .pfx · Máximo 5 MB</span>
+                </label>
+              </div>
+
+              <!-- PASO 2: Contraseña -->
+              @if (pasoFirma >= 2) {
+                <div class="fd-field">
+                  <label class="fd-label">
+                    <i class="bi bi-lock-fill"></i>
+                    Contraseña del certificado *
+                  </label>
+                  <div class="fd-password-wrap">
+                    <input
+                      [type]="mostrarPassword ? 'text' : 'password'"
+                      class="fd-input"
+                      placeholder="Contraseña de su certificado .p12"
+                      [(ngModel)]="passwordCertificado"
+                      [disabled]="firmandoConCertificado"
+                      autocomplete="current-password"
+                      (input)="pasoFirma = passwordCertificado.length >= 1 ? 3 : 2"
+                    />
+                    <button
+                      type="button"
+                      class="fd-toggle-pass"
+                      (click)="toggleMostrarPassword()"
+                      [title]="mostrarPassword ? 'Ocultar contraseña' : 'Mostrar contraseña'"
+                    >
+                      <i class="bi" [ngClass]="mostrarPassword ? 'bi-eye-slash-fill' : 'bi-eye-fill'"></i>
+                    </button>
+                  </div>
+                  <p class="fd-hint">
+                    <i class="bi bi-shield-lock" style="color:#10b981"></i>
+                    La contraseña nunca se almacena — se usa solo para desbloquear el certificado en memoria.
+                  </p>
+                </div>
+
+                <!-- Observación -->
+                <div class="fd-field">
+                  <label class="fd-label">
+                    <i class="bi bi-chat-left-text-fill"></i>
+                    Observación (opcional)
+                  </label>
+                  <textarea
+                    class="fd-textarea"
+                    rows="2"
+                    maxlength="500"
+                    placeholder="Observación sobre esta firma..."
+                    [(ngModel)]="observacionFirma"
+                    [disabled]="firmandoConCertificado"
+                  ></textarea>
+                </div>
+              }
+
+              <!-- Error -->
+              @if (errorCertificado) {
+                <div class="fd-alert fd-alert-error">
+                  <i class="bi bi-exclamation-triangle-fill"></i>
+                  {{ errorCertificado }}
+                </div>
+              }
+
+              <!-- Botones -->
+              <div class="fd-actions">
+                <button
+                  type="button"
+                  class="fd-btn-secondary"
+                  (click)="cerrarModalFirmaDigital()"
+                  [disabled]="firmandoConCertificado"
+                >
+                  Cancelar
+                </button>
+
+                <button
+                  type="button"
+                  class="fd-btn-primary"
+                  (click)="firmarConCertificado()"
+                  [disabled]="!certificadoSeleccionado || !passwordCertificado || firmandoConCertificado"
+                >
+                  @if (!firmandoConCertificado) {
+                    <i class="bi bi-pen-fill"></i>
+                    Firmar documento
+                  } @else {
+                    <span class="fd-signing">
+                      <span class="fd-spinner"></span>
+                      Aplicando firma digital...
+                    </span>
+                  }
+                </button>
+              </div>
+
+            }<!-- /formulario -->
+
+          </div>
+          }<!-- /modo pyhanko -->
+
+          <!-- ══════════════════════════════════════
+               MODO 2 — FirmaEC (subir PDF externo)
+          ══════════════════════════════════════ -->
+          <div class="fd-body" *ngIf="modoFirma === 'firmaec'">
+
+            <div class="fd-info-row">
+              <div class="fd-info-item">
+                <span>Documento</span>
+                <strong>{{ solicitud?.codigo_solicitud }}.pdf</strong>
+              </div>
+              <div class="fd-info-item">
+                <span>Rol</span>
+                <strong>{{ getMiRolTexto() }}</strong>
+              </div>
+            </div>
+
+            <div class="fd-guide">
+              <div class="fd-guide-step">
+                <span class="fd-guide-num">1</span>
+                <div>
+                  <strong>Descargar el PDF</strong>
+                  <p>Use el botón "Descargar" del panel de acciones para obtener el PDF actual.</p>
+                </div>
+              </div>
+              <div class="fd-guide-arrow">→</div>
+              <div class="fd-guide-step">
+                <span class="fd-guide-num">2</span>
+                <div>
+                  <strong>Firmar con FirmaEC</strong>
+                  <p>Abra el PDF en la aplicación FirmaEC de su equipo y fírmelo con su certificado.</p>
+                </div>
+              </div>
+              <div class="fd-guide-arrow">→</div>
+              <div class="fd-guide-step">
+                <span class="fd-guide-num">3</span>
+                <div>
+                  <strong>Subir PDF firmado</strong>
+                  <p>Seleccione abajo el PDF ya firmado por FirmaEC.</p>
+                </div>
+              </div>
+            </div>
+
+            <!-- Zona de subida -->
+            <div class="fd-field">
+              <label class="fd-label">
+                <i class="bi bi-file-earmark-pdf-fill"></i>
+                PDF firmado con FirmaEC *
+              </label>
+              <label class="fd-upload-zone" [class.has-file]="archivoFirmadoElectronico">
+                <input
+                  type="file"
+                  accept=".pdf,application/pdf"
+                  (change)="seleccionarArchivoFirmadoElectronico($event)"
+                  [disabled]="procesando"
+                />
+                <i class="bi" [ngClass]="archivoFirmadoElectronico ? 'bi-file-earmark-check-fill' : 'bi-cloud-arrow-up'"></i>
+                <strong>{{ nombreArchivoFirmadoElectronico || 'Seleccionar PDF firmado con FirmaEC' }}</strong>
+                <span>Solo PDF · Máximo 15 MB</span>
+              </label>
+            </div>
+
+            <!-- Acciones del PDF seleccionado -->
+            <div class="fd-preview-actions" *ngIf="archivoFirmadoElectronico">
+              <button type="button" class="fd-btn-outline sm" (click)="verPdfFirmadoElectronico()" [disabled]="procesando">
+                <i class="bi bi-eye-fill"></i> Ver PDF
+              </button>
+              <button type="button" class="fd-btn-danger sm" (click)="quitarPdfFirmadoElectronico()" [disabled]="procesando">
+                <i class="bi bi-trash-fill"></i> Quitar
+              </button>
+            </div>
+
+            <div class="fd-alert fd-alert-error" *ngIf="error">
+              <i class="bi bi-exclamation-triangle-fill"></i>
+              {{ error }}
+            </div>
+
+            <div class="fd-alert fd-alert-success" *ngIf="mensajeOk">
+              <i class="bi bi-check-circle-fill"></i>
+              {{ mensajeOk }}
+            </div>
+
+            <!-- Botones FirmaEC -->
+            <div class="fd-actions">
+              <button
+                type="button"
+                class="fd-btn-secondary"
+                (click)="cerrarModalFirmaDigital()"
+                [disabled]="procesando"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                class="fd-btn-primary"
+                (click)="subirFirmaElectronica()"
+                [disabled]="procesando || !archivoFirmadoElectronico"
+              >
+                <span *ngIf="!procesando">
+                  <i class="bi bi-send-check-fill"></i>
+                  Enviar PDF firmado
+                </span>
+                <span *ngIf="procesando" class="fd-signing">
+                  <span class="fd-spinner"></span>
+                  Enviando...
+                </span>
+              </button>
+            </div>
+
+          </div><!-- /modo firmaec -->
+
+          <!-- ══════════════════════════════════════
+               HISTORIAL DE FIRMAS
+          ══════════════════════════════════════ -->
+          <div class="fd-historial" *ngIf="firmasRegistradas.length > 0">
+            <div class="fd-historial-header">
+              <i class="bi bi-clock-history"></i>
+              Historial de firmas digitales ({{ firmasRegistradas.length }})
+            </div>
+            <div class="fd-firma-row" *ngFor="let firma of firmasRegistradas">
+              <div class="fd-firma-rol">
+                <i class="bi bi-person-badge-fill"></i>
+                {{ getRolTexto(firma.rol_firmante) }}
+              </div>
+              <div class="fd-firma-detalle">
+                <span class="fd-firma-modo" [class.pyhanko]="firma.modo_firma === 'pyhanko'">
+                  {{ getModoFirmaTexto(firma.modo_firma) }}
+                </span>
+                <span>{{ firma.subject_cn || firma.nombres + ' ' + firma.apellidos }}</span>
+                <span class="fd-firma-fecha">{{ firma.created_at }}</span>
+              </div>
+              <div class="fd-firma-estado" [class.valida]="firma.firma_valida">
+                <i class="bi" [ngClass]="firma.firma_valida ? 'bi-patch-check-fill' : 'bi-x-circle-fill'"></i>
+                {{ firma.firma_valida ? 'Válida' : 'Sin validar' }}
+              </div>
+            </div>
+          </div>
+
+        </section>
+      </div>
+
+      <!-- =====================================================
+           MODAL RECHAZO
+      ====================================================== -->
+
+      <div
+        class="modal-backdrop-rechazo"
+        *ngIf="mostrarModalRechazo"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="modal-rechazo-titulo"
+      >
+        <section class="modal-rechazo-card">
+          <button
+            type="button"
+            class="close-modal-rechazo"
+            (click)="cerrarModalRechazo()"
+            [disabled]="procesandoRechazo"
+            aria-label="Cerrar modal rechazo"
+          >
+            ×
+          </button>
+
+          <div class="rechazo-modal-header">
+            <img src="inamhi-logo-LETRA-AZUL.png" alt="INAMHI" class="rechazo-logo">
+
+            <div>
+              <h3 id="modal-rechazo-titulo">¿Rechazar solicitud?</h3>
+              <p>{{ solicitud?.codigo_solicitud }}</p>
+            </div>
+          </div>
+
+          <label class="rechazo-label">
+            Motivo del rechazo *
+            <textarea
+              [(ngModel)]="motivoRechazo"
+              rows="6"
+              maxlength="1000"
+              placeholder="Explique el motivo del rechazo..."
+              [disabled]="procesandoRechazo"
+            ></textarea>
+
+            <span class="counter" aria-live="polite">
+              {{ motivoRechazo.length }}/1000
+            </span>
+          </label>
+
+          <div class="rechazo-actions">
+            <button
+              type="button"
+              class="cancel-modal-btn"
+              (click)="cerrarModalRechazo()"
+              [disabled]="procesandoRechazo"
+            >
+              Cancelar
+            </button>
+
+            <button
+              type="button"
+              class="confirm-reject-btn"
+              (click)="rechazar()"
+              [disabled]="procesandoRechazo"
+            >
+              <span *ngIf="!procesandoRechazo">
+                <i class="bi bi-x-circle-fill"></i>
+                Confirmar rechazo
+              </span>
+
+              <span *ngIf="procesandoRechazo">
+                Procesando rechazo...
+              </span>
+            </button>
+          </div>
+        </section>
+      </div>
+    </ng-container>
+  </main>
+</section>
+
+@if (mostrarVisorPdf) {
+  <app-pdf-viewer
+    [url]="urlVisorPdf"
+    [titulo]="tituloVisorPdf"
+    (cerrar)="cerrarVisorPdf()"
+  />
+}
