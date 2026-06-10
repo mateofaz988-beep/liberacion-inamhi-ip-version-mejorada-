@@ -63,11 +63,13 @@
 
 .brand {
   display: flex;
+  flex-direction: column;
   align-items: center;
-  gap: 14px;
+  gap: 6px;
   padding: 0 4px 24px;
   margin-bottom: 16px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.09);
+  text-align: center;
 }
 
 .logo-box {
@@ -89,6 +91,19 @@
 .logo-box i {
   font-size: 26px;
   line-height: 1;
+}
+
+.logo-box img {
+  width: 40px;
+  height: 40px;
+  object-fit: contain;
+}
+
+.brand img {
+  width: 150px;
+  height: auto;
+  object-fit: contain;
+  filter: drop-shadow(0 4px 14px rgba(99, 179, 255, 0.30));
 }
 
 .brand h2 {
@@ -152,10 +167,23 @@
   transform: translateX(4px);
 }
 
+.menu a:hover i,
+.menu button:hover i {
+  color: #60a5fa;
+}
+
 .menu a.active,
 .menu button.active {
   color: #ffffff;
-  background: rgba(255, 255, 255, 0.12);
+  background: linear-gradient(135deg, rgba(37, 99, 235, 0.30), rgba(2, 132, 199, 0.18));
+  border-left: 3px solid #3b82f6;
+  padding-left: 11px;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
+}
+
+.menu a.active i,
+.menu button.active i {
+  color: #60a5fa;
 }
 
 /* =====================================================
@@ -831,11 +859,16 @@ td {
 
 tbody tr {
   background: #ffffff;
-  transition: background 0.18s ease;
+  transition: background 0.18s ease, box-shadow 0.18s ease;
+}
+
+tbody tr:nth-child(even) {
+  background: #f8fafc;
 }
 
 tbody tr:hover {
-  background: #f8fafc;
+  background: #eff6ff;
+  box-shadow: inset 3px 0 0 #3b82f6;
 }
 
 tbody tr:last-child td {
@@ -903,6 +936,18 @@ strong.code {
   border: 1px solid #cbd5e1;
 }
 
+.status.tics {
+  color: #1e40af;
+  background: #dbeafe;
+  border: 1px solid #93c5fd;
+}
+
+.status.ejecucion {
+  color: #5b21b6;
+  background: #ede9fe;
+  border: 1px solid #c4b5fd;
+}
+
 /* =====================================================
    COLUMNA DE ACCIONES
 ===================================================== */
@@ -963,8 +1008,8 @@ strong.code {
 .sidebar::-webkit-scrollbar,
 .content::-webkit-scrollbar,
 .table-wrapper::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 5px;
+  height: 5px;
 }
 
 .sidebar::-webkit-scrollbar-thumb,
@@ -1120,6 +1165,12 @@ strong.code {
   justify-content: center;
   line-height: 1;
   flex-shrink: 0;
+  animation: badge-pulse 2s ease-in-out infinite;
+}
+
+@keyframes badge-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.55); }
+  50%       { box-shadow: 0 0 0 5px rgba(239, 68, 68, 0); }
 }
 
 /* =====================================================

@@ -1254,6 +1254,13 @@ def listar_solicitudes_admin():
         condiciones = []
         parametros = []
 
+        rol_actual = request.usuario_actual.get("rol")
+        usuario_id = request.usuario_actual.get("id")
+
+        if rol_actual == "jefe_inmediato":
+            condiciones.append("s.jefe_asignado_id = %s")
+            parametros.append(usuario_id)
+
         if estado:
             condiciones.append("s.estado = %s")
             parametros.append(estado)

@@ -1,0 +1,25 @@
+[Unit]
+Description=INAMHI Liberación Web — Backend Flask
+After=network.target mysql.service
+Wants=mysql.service
+
+[Service]
+Type=notify
+User=www-data
+Group=www-data
+WorkingDirectory=/var/www/inamhi/backend
+EnvironmentFile=/var/www/inamhi/backend/.env
+
+ExecStart=/var/www/inamhi/venv/bin/gunicorn \
+    --config gunicorn.conf.py \
+    wsgi:app
+
+ExecReload=/bin/kill -s HUP $MAINPID
+KillMode=mixed
+TimeoutStopSec=10
+PrivateTmp=true
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
