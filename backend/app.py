@@ -2,6 +2,7 @@
 import json
 import uuid
 import smtplib
+import ssl
 import html
 import hashlib
 import tempfile
@@ -126,15 +127,86 @@ from utils.user_utils import (
 # configuración SMTP para envío de correos
 # =====================================================
 
-SMTP_HOST = os.getenv("SMTP_HOST", "")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_HOST     = os.getenv("SMTP_HOST", "")
+SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER     = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
-SMTP_FROM = os.getenv("SMTP_FROM", SMTP_USER)
+SMTP_FROM     = os.getenv("SMTP_FROM", SMTP_USER)
+SMTP_REPLY_TO = os.getenv("SMTP_REPLY_TO", "")
+
+# Microsoft Graph API (tiene prioridad sobre SMTP si está configurado)
+GRAPH_TENANT_ID      = os.getenv("GRAPH_TENANT_ID", "").strip()
+GRAPH_CLIENT_ID      = os.getenv("GRAPH_CLIENT_ID", "").strip()
+GRAPH_CLIENT_SECRET  = os.getenv("GRAPH_CLIENT_SECRET", "").strip()
+GRAPH_SENDER_EMAIL   = os.getenv("GRAPH_SENDER_EMAIL", "").strip()
+GRAPH_HABILITADO     = bool(GRAPH_TENANT_ID and GRAPH_CLIENT_ID and GRAPH_CLIENT_SECRET and GRAPH_SENDER_EMAIL)
 
 # =====================================================
 # función base para enviar correos
 # =====================================================
+
+def _enviar_correo_graph(destinatario: str, asunto: str, cuerpo: str, cuerpo_html: str | None = None) -> bool:
+    """Envía correo usando Microsoft Graph API con OAuth2 Client Credentials."""
+    try:
+        import msal, requests as _requests
+    except ImportError:
+        raise Exception("Librería 'msal' no instalada. Ejecute: pip install msal")
+
+    authority = f"https://login.microsoftonline.com/{GRAPH_TENANT_ID}"
+    app_msal = msal.ConfidentialClientApplication(
+        client_id=GRAPH_CLIENT_ID,
+        client_credential=GRAPH_CLIENT_SECRET,
+        authority=authority,
+    )
+
+    resultado = app_msal.acquire_token_for_client(
+        scopes=["https://graph.microsoft.com/.default"]
+    )
+
+    if "access_token" not in resultado:
+        error_desc = resultado.get("error_description", resultado.get("error", "desconocido"))
+        raise Exception(f"[graph] no se pudo obtener token OAuth2: {error_desc}")
+
+    token = resultado["access_token"]
+    log.debug("[graph] token OAuth2 obtenido correctamente")
+
+    contenido_body = cuerpo_html if cuerpo_html else cuerpo.replace("\n", "<br>")
+    content_type   = "HTML" if cuerpo_html else "Text"
+
+    payload = {
+        "message": {
+            "subject": asunto,
+            "body": {
+                "contentType": content_type,
+                "content": contenido_body,
+            },
+            "toRecipients": [
+                {"emailAddress": {"address": destinatario}}
+            ],
+            "from": {
+                "emailAddress": {"address": GRAPH_SENDER_EMAIL}
+            },
+        },
+        "saveToSentItems": True,
+    }
+
+    url = f"https://graph.microsoft.com/v1.0/users/{GRAPH_SENDER_EMAIL}/sendMail"
+    resp = _requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=20,
+    )
+
+    if resp.status_code == 202:
+        log.info("[graph] correo enviado a %s como %s", destinatario, GRAPH_SENDER_EMAIL)
+        return True
+
+    raise Exception(f"[graph] error al enviar: {resp.status_code} — {resp.text}")
+
 
 def _logo_email_tag():
     return (
@@ -148,7 +220,19 @@ def _logo_path():
 
 
 def enviar_correo(destinatario, asunto, cuerpo, cuerpo_html=None):
-    if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
+    # Si Graph API está configurado tiene prioridad sobre SMTP
+    if GRAPH_HABILITADO:
+        log.debug("[correo] usando Microsoft Graph API")
+        return _enviar_correo_graph(destinatario, asunto, cuerpo, cuerpo_html)
+
+    # Limpiar credenciales de posibles espacios/caracteres ocultos del .env
+    smtp_host     = SMTP_HOST.strip()
+    smtp_port     = int(str(SMTP_PORT).strip())
+    smtp_user     = SMTP_USER.strip()
+    smtp_password = SMTP_PASSWORD.strip()
+    smtp_from     = SMTP_FROM.strip()
+
+    if not smtp_host or not smtp_user or not smtp_password:
         raise Exception(
             "configuración SMTP incompleta. revise SMTP_HOST, SMTP_USER y SMTP_PASSWORD en el archivo .env."
         )
@@ -161,7 +245,6 @@ def enviar_correo(destinatario, asunto, cuerpo, cuerpo_html=None):
     tiene_logo = bool(cuerpo_html and os.path.exists(logo))
 
     if tiene_logo:
-        # multipart/related permite referenciar imágenes inline por CID
         mensaje = MIMEMultipart("related")
         alternativo = MIMEMultipart("alternative")
         alternativo.attach(MIMEText(cuerpo, "plain", "utf-8"))
@@ -179,17 +262,36 @@ def enviar_correo(destinatario, asunto, cuerpo, cuerpo_html=None):
         if cuerpo_html:
             mensaje.attach(MIMEText(cuerpo_html, "html", "utf-8"))
 
-    mensaje["Subject"] = asunto
-    mensaje["From"]    = SMTP_FROM
-    mensaje["To"]      = destinatario
+    mensaje["Subject"]  = asunto
+    mensaje["From"]     = smtp_from
+    mensaje["To"]       = destinatario
+    if SMTP_REPLY_TO:
+        mensaje["Reply-To"] = SMTP_REPLY_TO.strip()
 
-    servidor = smtplib.SMTP(SMTP_HOST, SMTP_PORT)
-    servidor.starttls()
-    servidor.login(SMTP_USER, SMTP_PASSWORD)
-    servidor.sendmail(SMTP_USER, [destinatario], mensaje.as_string())
+    # Contexto TLS explícito — requerido por Microsoft 365 / Exchange Online
+    contexto_tls = ssl.create_default_context()
+
+    log.debug("[smtp] conectando a %s:%s", smtp_host, smtp_port)
+    servidor = smtplib.SMTP(smtp_host, smtp_port, timeout=30)
+
+    # ehlo() antes de STARTTLS — obligatorio para Exchange Online
+    servidor.ehlo()
+    log.debug("[smtp] ehlo inicial ok")
+
+    servidor.starttls(context=contexto_tls)
+    log.debug("[smtp] starttls ok")
+
+    # ehlo() después de STARTTLS — Exchange Online lo requiere para renegociar capacidades
+    servidor.ehlo()
+    log.debug("[smtp] ehlo post-starttls ok")
+
+    servidor.login(smtp_user, smtp_password)
+    log.debug("[smtp] login ok como %s", smtp_user)
+
+    servidor.sendmail(smtp_user, [destinatario], mensaje.as_string())
     servidor.quit()
 
-    log.info(f"correo enviado correctamente a {destinatario}")
+    log.info("[smtp] correo enviado correctamente a %s", destinatario)
     return True
 
 
@@ -4036,7 +4138,6 @@ def descargar_pdf_actual_proceso_electronico_admin(codigo_solicitud):
 
 @app.route("/api/admin/solicitudes/<int:solicitud_id>", methods=["GET"])
 @token_requerido
-@roles_permitidos("administrador", "analista_tics", "jefe_inmediato", "maxima_autoridad")
 def obtener_solicitud_admin(solicitud_id):
     conexion = get_db_connection()
 
@@ -4215,30 +4316,30 @@ def obtener_solicitud_admin(solicitud_id):
 # flujo administrativo de aprobación / rechazo
 # =====================================================
 
-def obtener_siguiente_estado_por_rol(estado_actual, rol_actual):
+def obtener_siguiente_estado_por_rol(estado_actual, rol_actual=None):
     reglas = {
-        ("pendiente_jefe_inmediato", "jefe_inmediato"): {
+        "pendiente_jefe_inmediato": {
             "nuevo_estado": "pendiente_maxima_autoridad",
             "nueva_etapa": "maxima_autoridad"
         },
-        ("pendiente_maxima_autoridad", "maxima_autoridad"): {
+        "pendiente_maxima_autoridad": {
             "nuevo_estado": "pendiente_tics",
             "nueva_etapa": "tics"
         },
-        ("pendiente_tics", "analista_tics"): {
+        "pendiente_tics": {
             "nuevo_estado": "pendiente_ejecucion_tics",
             "nueva_etapa": "ejecucion_tics"
         },
-        ("pendiente_ejecucion_tics", "analista_tics"): {
+        "pendiente_ejecucion_tics": {
             "nuevo_estado": "finalizada",
             "nueva_etapa": "finalizado"
         }
     }
 
-    return reglas.get((estado_actual, rol_actual))
+    return reglas.get(estado_actual)
 
 
-def obtener_estado_rechazo_por_rol(estado_actual, rol_actual):
+def obtener_estado_rechazo_por_rol(estado_actual, rol_actual=None):
     rechazos = {
         "pendiente_jefe_inmediato": {
             "rol": "jefe_inmediato",
@@ -4257,15 +4358,7 @@ def obtener_estado_rechazo_por_rol(estado_actual, rol_actual):
         }
     }
 
-    regla = rechazos.get(estado_actual)
-
-    if regla is None:
-        return None
-
-    if regla["rol"] != rol_actual:
-        return None
-
-    return regla
+    return rechazos.get(estado_actual)
 
 def archivo_pdf_valido(archivo):
     if archivo is None:
@@ -4357,7 +4450,6 @@ def colocar_firma_en_pdf(pdf_entrada, imagen_firma, pdf_salida):
 
 @app.route("/api/admin/solicitudes/<int:solicitud_id>/firma-electronica", methods=["POST"])
 @token_requerido
-@roles_permitidos("administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics")
 def subir_firma_electronica_y_generar_pdf(solicitud_id):
     usuario_actual = request.usuario_actual
     rol_actual = usuario_actual["rol"]
@@ -4607,7 +4699,6 @@ def subir_firma_electronica_y_generar_pdf(solicitud_id):
 
 @app.route("/api/admin/solicitudes/<int:solicitud_id>/documentos", methods=["POST"])
 @token_requerido
-@roles_permitidos("administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics")
 def subir_documento_firmado(solicitud_id):
     usuario_actual = request.usuario_actual
     rol_actual = usuario_actual["rol"]
@@ -4784,7 +4875,6 @@ def subir_documento_firmado(solicitud_id):
 
 @app.route("/api/admin/solicitudes/<int:solicitud_id>/documento-actual", methods=["GET"])
 @token_requerido
-@roles_permitidos("administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics")
 def descargar_documento_actual_solicitud(solicitud_id):
     conexion = get_db_connection()
 
@@ -4933,7 +5023,6 @@ def descargar_documento_actual_solicitud(solicitud_id):
 
 @app.route("/api/admin/solicitudes/<int:solicitud_id>/aprobar", methods=["PUT"])
 @token_requerido
-@roles_permitidos("administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics")
 def aprobar_solicitud(solicitud_id):
     usuario_actual = request.usuario_actual
     rol_actual = usuario_actual["rol"]
@@ -5104,8 +5193,7 @@ def aprobar_solicitud(solicitud_id):
         error_correo = None
 
         if (
-            rol_actual == "analista_tics"
-            and estado_anterior == "pendiente_ejecucion_tics"
+            estado_anterior == "pendiente_ejecucion_tics"
             and nuevo_estado == "finalizada"
         ):
             try:
@@ -5147,15 +5235,13 @@ def aprobar_solicitud(solicitud_id):
         mensaje_respuesta = "solicitud aprobada correctamente."
 
         if (
-            rol_actual == "analista_tics"
-            and estado_anterior == "pendiente_tics"
+            estado_anterior == "pendiente_tics"
             and nuevo_estado == "pendiente_ejecucion_tics"
         ):
             mensaje_respuesta = "validación TICS aprobada correctamente. la solicitud pasa a ejecución técnica."
 
         if (
-            rol_actual == "analista_tics"
-            and estado_anterior == "pendiente_ejecucion_tics"
+            estado_anterior == "pendiente_ejecucion_tics"
             and nuevo_estado == "finalizada"
         ):
             if correo_enviado:
@@ -5437,7 +5523,6 @@ def enviar_correo_finalizacion_solicitud(solicitud):
 
 @app.route("/api/admin/solicitudes/<int:solicitud_id>/rechazar", methods=["PUT"])
 @token_requerido
-@roles_permitidos("jefe_inmediato", "maxima_autoridad", "analista_tics")
 def rechazar_solicitud(solicitud_id):
     usuario_actual = request.usuario_actual
     rol_actual = usuario_actual["rol"]
@@ -5516,31 +5601,28 @@ def rechazar_solicitud(solicitud_id):
         etapa_anterior = solicitud["etapa_actual"]
 
         # =====================================================
-        # Reglas de rechazo por rol
+        # Reglas de rechazo por estado de solicitud
         # =====================================================
 
         reglas_rechazo = {
-            "jefe_inmediato": {
-                "estado_permitido": "pendiente_jefe_inmediato",
+            "pendiente_jefe_inmediato": {
                 "nuevo_estado": "rechazada_jefe_inmediato",
                 "nueva_etapa": "jefe_inmediato",
                 "mensaje": "solicitud rechazada por el jefe inmediato."
             },
-            "maxima_autoridad": {
-                "estado_permitido": "pendiente_maxima_autoridad",
+            "pendiente_maxima_autoridad": {
                 "nuevo_estado": "rechazada_maxima_autoridad",
                 "nueva_etapa": "maxima_autoridad",
                 "mensaje": "solicitud rechazada por la máxima autoridad."
             },
-            "analista_tics": {
-                "estado_permitido": "pendiente_tics",
+            "pendiente_tics": {
                 "nuevo_estado": "rechazada_tics",
                 "nueva_etapa": "tics",
                 "mensaje": "solicitud rechazada por TICS."
             }
         }
 
-        regla = reglas_rechazo.get(rol_actual)
+        regla = reglas_rechazo.get(estado_anterior)
 
         if regla is None:
             cursor.close()
@@ -5548,18 +5630,8 @@ def rechazar_solicitud(solicitud_id):
 
             return jsonify({
                 "estado": "error",
-                "mensaje": "rol no autorizado para rechazar solicitudes."
-            }), 403
-
-        if estado_anterior != regla["estado_permitido"]:
-            cursor.close()
-            conexion.close()
-
-            return jsonify({
-                "estado": "error",
-                "mensaje": f"la solicitud no puede ser rechazada por {rol_actual} en el estado actual.",
-                "estado_actual": estado_anterior,
-                "estado_requerido": regla["estado_permitido"]
+                "mensaje": "la solicitud no está en un estado que permita rechazo.",
+                "estado_actual": estado_anterior
             }), 409
 
         # =====================================================
@@ -8994,7 +9066,6 @@ def _inicializar_tablas_firma():
 
 @app.route("/api/admin/solicitudes/<int:solicitud_id>/validar-certificado", methods=["POST"])
 @token_requerido
-@roles_permitidos("jefe_inmediato", "maxima_autoridad", "analista_tics")
 def validar_certificado_digital(solicitud_id):
     if not PYHANKO_DISPONIBLE:
         return jsonify({
@@ -9048,7 +9119,6 @@ def validar_certificado_digital(solicitud_id):
 
 @app.route("/api/admin/solicitudes/<int:solicitud_id>/firmar-pyhanko", methods=["POST"])
 @token_requerido
-@roles_permitidos("jefe_inmediato", "maxima_autoridad", "analista_tics")
 def firmar_pdf_con_pyhanko(solicitud_id):
     if not PYHANKO_DISPONIBLE:
         return jsonify({
@@ -9117,32 +9187,33 @@ def firmar_pdf_con_pyhanko(solicitud_id):
             cursor.close(); conexion.close()
             return jsonify({"estado": "error", "mensaje": "La solicitud está bloqueada."}), 409
 
-        # Verificar que el rol puede firmar en la etapa actual
-        mapa_rol_etapa = {
-            "jefe_inmediato":   ["jefe_inmediato"],
-            "maxima_autoridad": ["maxima_autoridad"],
-            "analista_tics":    ["tics", "ejecucion_tics"]
+        # Determinar el rol firmante según la etapa actual de la solicitud
+        mapa_etapa_rol = {
+            "jefe_inmediato":   "jefe_inmediato",
+            "maxima_autoridad": "maxima_autoridad",
+            "tics":             "analista_tics",
+            "ejecucion_tics":   "analista_tics"
         }
-        etapas_permitidas = mapa_rol_etapa.get(rol_actual, [])
-        if solicitud["etapa_actual"] not in etapas_permitidas:
+        rol_firmante = mapa_etapa_rol.get(solicitud["etapa_actual"])
+        if rol_firmante is None:
             cursor.close(); conexion.close()
             return jsonify({
                 "estado": "error",
-                "mensaje": f"No puede firmar en la etapa actual ({solicitud['etapa_actual']})."
-            }), 403
+                "mensaje": f"No se puede firmar en la etapa actual ({solicitud['etapa_actual']})."
+            }), 409
 
-        # Verificar que este rol no haya firmado ya
+        # Verificar que esta etapa no haya sido firmada ya
         cursor.execute("""
             SELECT id FROM firmas_digitales
             WHERE solicitud_id = %s AND rol_firmante = %s
             LIMIT 1
-        """, (solicitud_id, rol_actual))
+        """, (solicitud_id, rol_firmante))
         firma_existente = cursor.fetchone()
         if firma_existente:
             cursor.close(); conexion.close()
             return jsonify({
                 "estado": "error",
-                "mensaje": "Ya existe una firma digital registrada para su rol en esta solicitud."
+                "mensaje": "Ya existe una firma digital registrada para esta etapa en la solicitud."
             }), 409
 
         # Obtener el PDF más reciente para firmar
@@ -9166,7 +9237,7 @@ def firmar_pdf_con_pyhanko(solicitud_id):
                 cursor.close(); conexion.close()
                 return jsonify({"estado": "error", "mensaje": error_pdf}), 404
 
-            incluir_tics = rol_actual == "analista_tics"
+            incluir_tics = solicitud["etapa_actual"] in ("tics", "ejecucion_tics")
             pdf_buffer = generar_pdf_solicitud_a4(solicitud_pdf, paginas_web, incluir_seccion_tics=incluir_tics)
 
             nombre_base_pdf = f"{solicitud['codigo_solicitud']}_base.pdf"
@@ -9182,7 +9253,7 @@ def firmar_pdf_con_pyhanko(solicitud_id):
 
         # Generar nombre del PDF firmado (versionado, nunca sobrescribir)
         timestamp     = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        nombre_pdf_firmado = f"{solicitud['codigo_solicitud']}_{rol_actual}_pyhanko_{timestamp}.pdf"
+        nombre_pdf_firmado = f"{solicitud['codigo_solicitud']}_{rol_firmante}_pyhanko_{timestamp}.pdf"
         ruta_pdf_firmado   = os.path.join(FIRMADOS_FOLDER, nombre_pdf_firmado)
 
         # Hash del PDF de entrada
@@ -9194,7 +9265,7 @@ def firmar_pdf_con_pyhanko(solicitud_id):
             f.write(datos_cert)
 
         # --- FIRMA CON PYHANKO (función centralizada) ---
-        nombre_campo = f"Firma_{rol_actual}_{timestamp}"
+        nombre_campo = f"Firma_{rol_firmante}_{timestamp}"
         nombre_firmante_qr = f"{usuario_actual.get('nombres', '')} {usuario_actual.get('apellidos', '')}".strip()
         _fecha_qr = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S-05:00")
         url_qr_firma = (
@@ -9210,7 +9281,7 @@ def firmar_pdf_con_pyhanko(solicitud_id):
                 ruta_pdf_salida=ruta_pdf_firmado,
                 ruta_cert=ruta_cert_tmp,
                 password_bytes=password.encode("utf-8"),
-                rol_firmante=rol_actual,
+                rol_firmante=rol_firmante,
                 razon=f"Aprobación institucional — {etapa_legible_pdf(solicitud['etapa_actual'])}",
                 ubicacion="Ecuador — INAMHI",
                 contacto=usuario_actual.get("correo", "inamhi@gob.ec"),
@@ -9250,7 +9321,7 @@ def firmar_pdf_con_pyhanko(solicitud_id):
                 firma_valida, resultado_validacion, observacion, ip_cliente
             ) VALUES (%s,%s,%s,%s,'pyhanko',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
         """, (
-            solicitud_id, usuario_id, rol_actual, solicitud["etapa_actual"],
+            solicitud_id, usuario_id, rol_firmante, solicitud["etapa_actual"],
             info_cert["subject_cn"], info_cert["subject_o"],
             info_cert["issuer_cn"], info_cert["numero_serie"],
             nombre_pdf_entrada, nombre_pdf_firmado, ruta_pdf_firmado,
@@ -9268,9 +9339,9 @@ def firmar_pdf_con_pyhanko(solicitud_id):
                 mime_type, firmado, firma_validada, observacion
             ) VALUES (%s,%s,%s,%s,'pdf_firmado_electronico',%s,%s,'application/pdf',1,1,%s)
         """, (
-            solicitud_id, solicitud["etapa_actual"], rol_actual, usuario_id,
+            solicitud_id, solicitud["etapa_actual"], rol_firmante, usuario_id,
             nombre_pdf_firmado, ruta_pdf_firmado,
-            f"PDF firmado digitalmente con pyHanko por {rol_actual}. Cert: {info_cert['subject_cn']}"
+            f"PDF firmado digitalmente con pyHanko por {rol_firmante}. Cert: {info_cert['subject_cn']}"
         ))
         documento_id = cursor.lastrowid
 
@@ -9292,7 +9363,7 @@ def firmar_pdf_con_pyhanko(solicitud_id):
         _registrar_version_documento(
             solicitud_id=solicitud_id, firma_id=firma_id,
             usuario_id=usuario_id, etapa=solicitud["etapa_actual"],
-            rol_firmante=rol_actual, tipo="pdf_firmado_pyhanko",
+            rol_firmante=rol_firmante, tipo="pdf_firmado_pyhanko",
             nombre_archivo=nombre_pdf_firmado,
             ruta_archivo=ruta_pdf_firmado,
             hash_sha256=hash_despues, tamano_bytes=tamano_bytes
@@ -9303,7 +9374,7 @@ def firmar_pdf_con_pyhanko(solicitud_id):
             solicitud_id=solicitud_id,
             modulo="firma_digital",
             accion="firmar_pdf_pyhanko",
-            descripcion=f"Firma digital pyHanko por {rol_actual}. Cert: {info_cert['subject_cn']}",
+            descripcion=f"Firma digital pyHanko por {rol_firmante} (usuario: {rol_actual}). Cert: {info_cert['subject_cn']}",
             datos_anteriores=None,
             datos_nuevos={
                 "firma_id": firma_id,

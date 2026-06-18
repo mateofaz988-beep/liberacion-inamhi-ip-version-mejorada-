@@ -267,37 +267,37 @@
         </div>
 
         <!-- Estados de advertencia y éxito -->
-        <div class="document-warning" *ngIf="esJefe() && !jefeHaSubidoDocumento">
+        <div class="document-warning" *ngIf="solicitud.estado === 'pendiente_jefe_inmediato' && !jefeHaSubidoDocumento">
           <i class="bi bi-exclamation-triangle-fill"></i>
           Debe subir el PDF firmado con FirmaEC. La solicitud pasará automáticamente a Máxima Autoridad.
         </div>
 
-        <div class="document-warning" *ngIf="esAutoridad() && !autoridadHaSubidoDocumento">
+        <div class="document-warning" *ngIf="solicitud.estado === 'pendiente_maxima_autoridad' && !autoridadHaSubidoDocumento">
           <i class="bi bi-exclamation-triangle-fill"></i>
           Suba el PDF firmado antes de aprobar.
         </div>
 
-        <div class="document-warning" *ngIf="esTics() && solicitud.estado === 'pendiente_tics' && !ticsHaSubidoDocumento">
+        <div class="document-warning" *ngIf="solicitud.estado === 'pendiente_tics' && !ticsHaSubidoDocumento">
           <i class="bi bi-exclamation-triangle-fill"></i>
           Suba el PDF firmado antes de aprobar la validación.
         </div>
 
-        <div class="document-success" *ngIf="esJefe() && jefeHaSubidoDocumento">
+        <div class="document-success" *ngIf="solicitud.estado === 'pendiente_jefe_inmediato' && jefeHaSubidoDocumento">
           <i class="bi bi-check-circle-fill"></i>
           PDF registrado. La solicitud fue enviada automáticamente a Máxima Autoridad.
         </div>
 
-        <div class="document-success" *ngIf="esAutoridad() && autoridadHaSubidoDocumento">
+        <div class="document-success" *ngIf="solicitud.estado === 'pendiente_maxima_autoridad' && autoridadHaSubidoDocumento">
           <i class="bi bi-check-circle-fill"></i>
           PDF registrado. Ya puede aprobar para enviar a TICS.
         </div>
 
-        <div class="document-success" *ngIf="esTics() && solicitud.estado === 'pendiente_tics' && ticsHaSubidoDocumento">
+        <div class="document-success" *ngIf="solicitud.estado === 'pendiente_tics' && ticsHaSubidoDocumento">
           <i class="bi bi-check-circle-fill"></i>
           PDF registrado. Ya puede aprobar la validación TICS.
         </div>
 
-        <div class="document-success" *ngIf="esTics() && solicitud.estado === 'pendiente_ejecucion_tics'">
+        <div class="document-success" *ngIf="solicitud.estado === 'pendiente_ejecucion_tics'">
           <i class="bi bi-check-circle-fill"></i>
           Validación TICS aprobada. Ejecute la activación técnica y finalice el proceso.
         </div>

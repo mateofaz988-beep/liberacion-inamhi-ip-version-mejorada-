@@ -191,7 +191,7 @@ export const routes: Routes = [
     component: SolicitudDetalle,
     canActivate: [roleGuard],
     data: {
-      roles: ['jefe_inmediato']
+      roles: ['jefe_inmediato', 'maxima_autoridad', 'analista_tics', 'administrador']
     }
   },
   {
@@ -199,7 +199,7 @@ export const routes: Routes = [
     component: SolicitudDetalle,
     canActivate: [roleGuard],
     data: {
-      roles: ['jefe_inmediato']
+      roles: ['jefe_inmediato', 'maxima_autoridad', 'analista_tics', 'administrador']
     }
   },
 
@@ -236,7 +236,7 @@ export const routes: Routes = [
     component: SolicitudDetalle,
     canActivate: [roleGuard],
     data: {
-      roles: ['maxima_autoridad']
+      roles: ['jefe_inmediato', 'maxima_autoridad', 'analista_tics', 'administrador']
     }
   },
   {
@@ -244,7 +244,7 @@ export const routes: Routes = [
     component: SolicitudDetalle,
     canActivate: [roleGuard],
     data: {
-      roles: ['maxima_autoridad']
+      roles: ['jefe_inmediato', 'maxima_autoridad', 'analista_tics', 'administrador']
     }
   },
 
@@ -281,7 +281,7 @@ export const routes: Routes = [
     component: SolicitudDetalle,
     canActivate: [roleGuard],
     data: {
-      roles: ['analista_tics']
+      roles: ['jefe_inmediato', 'maxima_autoridad', 'analista_tics', 'administrador']
     }
   },
   {
@@ -289,7 +289,7 @@ export const routes: Routes = [
     component: SolicitudDetalle,
     canActivate: [roleGuard],
     data: {
-      roles: ['analista_tics']
+      roles: ['jefe_inmediato', 'maxima_autoridad', 'analista_tics', 'administrador']
     }
   },
 

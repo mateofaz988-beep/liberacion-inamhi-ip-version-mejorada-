@@ -109,19 +109,20 @@
         <h3>Proceso Electrónico</h3>
 
         <p class="description">
-          Complete el formulario institucional, genere o descargue el PDF,
-          fírmelo electrónicamente con FirmaEC y envíelo al flujo administrativo.
+          Complete el formulario institucional, cargue su certificado digital
+          (.p12) y el sistema firmará el documento automáticamente con su
+          identidad criptográfica.
         </p>
 
         <div class="firmaec-box">
-          <i class="bi bi-pc-display-horizontal"></i>
+          <i class="bi bi-file-earmark-lock2-fill"></i>
 
           <div>
-            <strong>Uso de FirmaEC</strong>
+            <strong>Firma con certificado digital (.p12)</strong>
             <p>
-              FirmaEC es una aplicación de escritorio. El sistema web no firma
-              directamente el documento; permite descargar el PDF y subir la
-              versión firmada electrónicamente.
+              El sistema firma el documento directamente en el servidor usando
+              su archivo de certificado y contraseña. No necesita instalar
+              ninguna aplicación externa.
             </p>
           </div>
         </div>
@@ -131,10 +132,10 @@
 
           <ol>
             <li>Llene el formulario institucional completo.</li>
-            <li>Genere o descargue el documento PDF correspondiente.</li>
-            <li>Abra el documento en FirmaEC desde su equipo.</li>
-            <li>Firme el PDF con certificado digital o token físico.</li>
-            <li>Suba el PDF firmado electrónicamente al sistema.</li>
+            <li>El sistema genera el documento PDF listo para firmar.</li>
+            <li>Cargue su archivo de certificado digital en formato .p12.</li>
+            <li>Ingrese la contraseña de su certificado.</li>
+            <li>El sistema firma el PDF criptográficamente de forma automática.</li>
             <li>El administrador continuará el flujo de aprobación.</li>
             <li>Al finalizar, recibirá la notificación institucional.</li>
           </ol>

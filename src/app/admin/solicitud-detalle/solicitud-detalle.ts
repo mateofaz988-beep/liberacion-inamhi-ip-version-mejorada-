@@ -239,6 +239,13 @@ export class SolicitudDetalle implements OnInit {
     return this.authService.isTics();
   }
 
+  getRolFirmanteActual(): RolFirmante {
+    const estado = this.solicitud?.estado || '';
+    if (estado === 'pendiente_jefe_inmediato') return 'jefe_inmediato';
+    if (estado === 'pendiente_maxima_autoridad') return 'maxima_autoridad';
+    return 'analista_tics';
+  }
+
   getTituloRol(): string {
     if (this.esAdmin()) {
       return 'Revisión administrativa';
@@ -632,11 +639,7 @@ export class SolicitudDetalle implements OnInit {
       return;
     }
 
-    const rolFirmante: RolFirmante = this.esJefe()
-      ? 'jefe_inmediato'
-      : this.esAutoridad()
-        ? 'maxima_autoridad'
-        : 'analista_tics';
+    const rolFirmante: RolFirmante = this.getRolFirmanteActual();
 
     this.procesando = true;
     this.error = '';
@@ -960,7 +963,6 @@ export class SolicitudDetalle implements OnInit {
         }
 
         if (
-          this.esTics() &&
           estadoAntes === 'pendiente_tics' &&
           estadoNuevo === 'pendiente_ejecucion_tics'
         ) {
@@ -1164,19 +1166,19 @@ export class SolicitudDetalle implements OnInit {
 
     const estado = this.solicitud.estado;
 
-    if (this.esJefe()) {
-      return estado === 'pendiente_jefe_inmediato' && this.jefeHaSubidoDocumento;
+    if (estado === 'pendiente_jefe_inmediato') {
+      return this.jefeHaSubidoDocumento;
     }
 
-    if (this.esAutoridad()) {
-      return estado === 'pendiente_maxima_autoridad' && this.autoridadHaSubidoDocumento;
+    if (estado === 'pendiente_maxima_autoridad') {
+      return this.autoridadHaSubidoDocumento;
     }
 
     return false;
   }
 
   puedeAprobarValidacionTics(): boolean {
-    if (!this.solicitud || !this.esTics()) {
+    if (!this.solicitud) {
       return false;
     }
 
@@ -1184,7 +1186,7 @@ export class SolicitudDetalle implements OnInit {
   }
 
   puedeFinalizarTics(): boolean {
-    if (!this.solicitud || !this.esTics()) {
+    if (!this.solicitud) {
       return false;
     }
 
@@ -1192,29 +1194,12 @@ export class SolicitudDetalle implements OnInit {
   }
 
   puedeRechazar(): boolean {
-    if (!this.solicitud) {
+    if (!this.solicitud || this.esAdmin()) {
       return false;
     }
 
     const estado = this.solicitud.estado;
-
-    if (this.esAdmin()) {
-      return false;
-    }
-
-    if (this.esJefe()) {
-      return estado === 'pendiente_jefe_inmediato';
-    }
-
-    if (this.esAutoridad()) {
-      return estado === 'pendiente_maxima_autoridad';
-    }
-
-    if (this.esTics()) {
-      return estado === 'pendiente_tics';
-    }
-
-    return false;
+    return ['pendiente_jefe_inmediato', 'pendiente_maxima_autoridad', 'pendiente_tics'].includes(estado);
   }
 
   getTextoBotonAprobar(): string {
@@ -1587,8 +1572,8 @@ export class SolicitudDetalle implements OnInit {
 
   get yaFirmoEsteRol(): boolean {
     if (!this.solicitud) return false;
-    const miRol = this.authService.getRol() || '';
-    return this.firmasRegistradas.some(f => f.rol_firmante === miRol);
+    const rolFirmante = this.getRolFirmanteActual();
+    return this.firmasRegistradas.some(f => f.rol_firmante === rolFirmante);
   }
 
   getRolTexto(rol: string): string {
