@@ -34,11 +34,11 @@
         <p>
           Complete la información requerida. El sistema generará automáticamente
           el ID único. Luego deberá firmar el documento.
-          
+
         </p>
       </div>
 
-      
+
     </section>
 
     <section class="success-card" *ngIf="enviado">
@@ -250,7 +250,8 @@
         </label>
       </div>
 
-      <div class="assigned-chief-card" *ngIf="jefeAsignado">
+      <!-- Área con un solo jefe: se muestra sin selector -->
+      <div class="assigned-chief-card" *ngIf="jefeAsignado && jefesDisponibles.length === 1">
         <div>
           <span>Jefe asignado automáticamente</span>
           <strong>
@@ -258,13 +259,39 @@
           </strong>
           <p>{{ jefeAsignado.cargo }}</p>
         </div>
-
         <small>
-          La solicitud será enviada únicamente al jefe responsable del área seleccionada.
+          La solicitud será enviada al jefe responsable del área seleccionada.
         </small>
       </div>
 
-      <div class="assigned-chief-card warning" *ngIf="formulario.get('area_id')?.value && !jefeAsignado">
+      <!-- Área con múltiples jefes: el solicitante elige -->
+      <div class="assigned-chief-card multi-jefe" *ngIf="jefesDisponibles.length > 1">
+        <div style="width:100%">
+          <span>Seleccione su jefe inmediato *</span>
+          <p style="margin:4px 0 10px;font-size:13px;color:#64748b">
+            Esta área tiene {{ jefesDisponibles.length }} jefes activos. Elija al que corresponde su solicitud.
+          </p>
+          <select
+            class="form-select"
+            style="width:100%;padding:10px 12px;border-radius:8px;border:1.5px solid #cbd5e1;font-size:14px;background:#fff"
+            (change)="seleccionarJefe(+$any($event.target).value)"
+          >
+            <option value="0">-- Seleccione un jefe --</option>
+            <option *ngFor="let j of jefesDisponibles" [value]="j.id">
+              {{ j.nombres }} {{ j.apellidos || '' }} — {{ j.cargo }}
+            </option>
+          </select>
+        </div>
+        <div class="assigned-chief-card" *ngIf="jefeAsignado" style="margin-top:10px;width:100%;border:none;background:#f0fdf4;padding:10px 14px">
+          <div>
+            <span>Jefe seleccionado</span>
+            <strong>{{ jefeAsignado.nombres }} {{ jefeAsignado.apellidos || '' }}</strong>
+            <p>{{ jefeAsignado.cargo }}</p>
+          </div>
+        </div>
+      </div>
+
+      <div class="assigned-chief-card warning" *ngIf="formulario.get('area_id')?.value && jefesDisponibles.length === 0 && !cargandoJefe">
         <div>
           <span>Jefe no configurado</span>
           <strong>No existe un jefe asignado para esta área.</strong>
@@ -412,7 +439,7 @@
           </div>
 
           <label>
-            URL *
+            URL / Nombre del sitio web*
             <input
               type="url"
               formControlName="url_pagina"
@@ -812,7 +839,7 @@
 
     <h3 class="confirm-title">Confirmar envío</h3>
 
-   
+
     <p class="confirm-body">
       Al enviarlo, la solicitud pasará únicamente al jefe responsable del
       área seleccionada.

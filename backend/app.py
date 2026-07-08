@@ -1,4 +1,4 @@
-﻿from io import BytesIO
+from io import BytesIO
 import json
 import uuid
 import smtplib
@@ -2548,23 +2548,74 @@ def preparar_solicitud_electronica_firmaec():
         # obtener jefe asignado del área
         # =====================================================
 
-        cursor.execute("""
-            select
-                id,
-                usuario_id,
-                nombres,
-                apellidos,
-                correo,
-                cargo
-            from area_personal
-            where area_id = %s
-              and tipo_responsable = 'jefe_area'
-              and estado = 'activo'
-            order by id asc
-            limit 1;
-        """, (area_id,))
+        jefe_area_personal_id = data.get("jefe_area_personal_id")
 
-        jefe_area = cursor.fetchone()
+        if jefe_area_personal_id:
+            try:
+                jefe_area_personal_id = int(jefe_area_personal_id)
+            except (TypeError, ValueError):
+                jefe_area_personal_id = None
+
+        if jefe_area_personal_id:
+            cursor.execute("""
+                select
+                    id,
+                    usuario_id,
+                    nombres,
+                    apellidos,
+                    correo,
+                    cargo
+                from area_personal
+                where id = %s
+                  and area_id = %s
+                  and tipo_responsable = 'jefe_area'
+                  and estado = 'activo'
+                limit 1;
+            """, (jefe_area_personal_id, area_id))
+
+            jefe_area = cursor.fetchone()
+
+            if jefe_area is None:
+                cursor.close()
+                conexion.close()
+                return jsonify({
+                    "estado": "error",
+                    "mensaje": "el jefe seleccionado no es válido para esta área."
+                }), 400
+        else:
+            # No se envió jefe_area_personal_id: buscar todos los jefes activos
+            cursor.execute("""
+                select
+                    id,
+                    usuario_id,
+                    nombres,
+                    apellidos,
+                    correo,
+                    cargo
+                from area_personal
+                where area_id = %s
+                  and tipo_responsable = 'jefe_area'
+                  and estado = 'activo'
+                order by id asc;
+            """, (area_id,))
+
+            jefes_activos = cursor.fetchall()
+
+            if len(jefes_activos) == 0:
+                jefe_area = None
+            elif len(jefes_activos) == 1:
+                jefe_area = jefes_activos[0]
+            else:
+                # Hay 2 o más jefes activos: el frontend debe pedir al solicitante que elija.
+                # Si llegamos aquí sin selección, es un error defensivo.
+                cursor.close()
+                conexion.close()
+                return jsonify({
+                    "estado": "error",
+                    "mensaje": "El área tiene múltiples jefes activos. Debe seleccionar uno.",
+                    "requiere_seleccion_jefe": True,
+                    "jefes": jefes_activos
+                }), 409
 
         if jefe_area is None:
             cursor.close()
@@ -6376,6 +6427,8 @@ def listar_funcionarios():
                 d.nombre  AS direccion_nombre,
                 ap.usuario_id,
                 u.usuario AS usuario_sistema,
+                u.rol     AS usuario_rol,
+                u.estado  AS usuario_estado,
                 ap.created_at,
                 ap.updated_at
             FROM area_personal ap
@@ -6434,8 +6487,24 @@ def crear_funcionario():
     area_id    = data.get("area_id")
     estado     = limpiar_texto(data.get("estado") or "activo")
 
+    # campos opcionales para cuenta de usuario
+    dar_acceso     = bool(data.get("dar_acceso"))
+    usuario_nombre = limpiar_texto(data.get("usuario_nombre") or "")
+    usuario_pass   = data.get("usuario_password") or ""
+    usuario_rol    = limpiar_texto(data.get("usuario_rol") or "")
+    usuario_estado = limpiar_texto(data.get("usuario_estado") or "activo")
+
     if not nombres or not apellidos or not cargo or not area_id:
         return jsonify({"estado": "error", "mensaje": "nombres, apellidos, cargo y área son obligatorios"}), 400
+
+    if dar_acceso:
+        if not usuario_nombre or not usuario_pass or not usuario_rol:
+            return jsonify({"estado": "error", "mensaje": "Para dar acceso, nombre de usuario, contraseña y rol son obligatorios."}), 400
+        roles_validos = ("administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics")
+        if usuario_rol not in roles_validos:
+            return jsonify({"estado": "error", "mensaje": "Rol de usuario no válido."}), 400
+        if usuario_estado not in ("activo", "inactivo"):
+            usuario_estado = "activo"
 
     if estado not in ("activo", "inactivo"):
         estado = "activo"
@@ -6447,17 +6516,45 @@ def crear_funcionario():
         return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
     try:
         cursor = conexion.cursor(dictionary=True)
+
+        nuevo_usuario_id = None
+        if dar_acceso:
+            # verificar que el nombre de usuario no exista
+            cursor.execute("SELECT id FROM usuarios WHERE usuario=%s LIMIT 1", (usuario_nombre,))
+            if cursor.fetchone():
+                cursor.close()
+                conexion.close()
+                return jsonify({"estado": "error", "mensaje": f"El nombre de usuario '{usuario_nombre}' ya está en uso."}), 400
+
+            from werkzeug.security import generate_password_hash
+            hash_pass = generate_password_hash(usuario_pass)
+            nombres_arr = (nombres or "").split()
+            apellidos_arr = (apellidos or "").split()
+            cursor.execute("""
+                INSERT INTO usuarios
+                    (nombres, apellidos, cedula, correo, usuario, password, rol, estado, created_at, updated_at)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
+            """, (
+                nombres, apellidos,
+                cedula or None, correo or None,
+                usuario_nombre, hash_pass,
+                usuario_rol, usuario_estado
+            ))
+            nuevo_usuario_id = cursor.lastrowid
+
         cursor.execute("""
             INSERT INTO area_personal
-                (area_id, nombres, apellidos, cedula, correo, cargo, tipo_responsable, estado, created_at, updated_at)
-            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
-        """, (area_id, nombres, apellidos, cedula or None, correo or None, cargo, tipo, estado))
+                (area_id, nombres, apellidos, cedula, correo, cargo, tipo_responsable, estado, usuario_id, created_at, updated_at)
+            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
+        """, (area_id, nombres, apellidos, cedula or None, correo or None, cargo, tipo, estado, nuevo_usuario_id))
         nuevo_id = cursor.lastrowid
         conexion.commit()
         cursor.close()
         conexion.close()
         return jsonify({"estado": "ok", "mensaje": "Funcionario registrado correctamente.", "id": nuevo_id}), 201
     except Exception as e:
+        try: conexion.rollback()
+        except Exception: pass
         return jsonify({"estado": "error", "mensaje": str(e)}), 500
 
 
@@ -6475,6 +6572,13 @@ def actualizar_funcionario(funcionario_id):
     area_id    = data.get("area_id")
     estado     = limpiar_texto(data.get("estado") or "activo")
 
+    # campos opcionales para cuenta de usuario
+    dar_acceso     = bool(data.get("dar_acceso"))
+    usuario_nombre = limpiar_texto(data.get("usuario_nombre") or "")
+    usuario_pass   = data.get("usuario_password") or ""
+    usuario_rol    = limpiar_texto(data.get("usuario_rol") or "")
+    usuario_estado = limpiar_texto(data.get("usuario_estado") or "activo")
+
     if not nombres or not apellidos or not cargo or not area_id:
         return jsonify({"estado": "error", "mensaje": "nombres, apellidos, cargo y área son obligatorios"}), 400
 
@@ -6488,21 +6592,92 @@ def actualizar_funcionario(funcionario_id):
         return jsonify({"estado": "error", "mensaje": "sin conexión"}), 500
     try:
         cursor = conexion.cursor(dictionary=True)
-        cursor.execute("""
-            UPDATE area_personal
-            SET area_id=%s, nombres=%s, apellidos=%s, cedula=%s, correo=%s,
-                cargo=%s, tipo_responsable=%s, estado=%s, updated_at=NOW()
-            WHERE id=%s
-        """, (area_id, nombres, apellidos, cedula or None, correo or None, cargo, tipo, estado, funcionario_id))
-        if cursor.rowcount == 0:
+
+        # obtener funcionario actual
+        cursor.execute("SELECT id, usuario_id FROM area_personal WHERE id=%s", (funcionario_id,))
+        func_actual = cursor.fetchone()
+        if not func_actual:
             cursor.close()
             conexion.close()
             return jsonify({"estado": "error", "mensaje": "Funcionario no encontrado."}), 404
+
+        usuario_id_actual = func_actual.get("usuario_id")
+        nuevo_usuario_id  = usuario_id_actual  # por defecto, conserva el vínculo
+
+        if dar_acceso:
+            roles_validos = ("administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics")
+            if usuario_rol not in roles_validos:
+                cursor.close(); conexion.close()
+                return jsonify({"estado": "error", "mensaje": "Rol de usuario no válido."}), 400
+            if usuario_estado not in ("activo", "inactivo"):
+                usuario_estado = "activo"
+
+            if usuario_id_actual:
+                # actualizar usuario existente
+                if usuario_nombre:
+                    cursor.execute("SELECT id FROM usuarios WHERE usuario=%s AND id!=%s LIMIT 1", (usuario_nombre, usuario_id_actual))
+                    if cursor.fetchone():
+                        cursor.close(); conexion.close()
+                        return jsonify({"estado": "error", "mensaje": f"El nombre de usuario '{usuario_nombre}' ya está en uso."}), 400
+                    cursor.execute(
+                        "UPDATE usuarios SET usuario=%s, rol=%s, estado=%s, updated_at=NOW() WHERE id=%s",
+                        (usuario_nombre, usuario_rol, usuario_estado, usuario_id_actual)
+                    )
+                else:
+                    cursor.execute(
+                        "UPDATE usuarios SET rol=%s, estado=%s, updated_at=NOW() WHERE id=%s",
+                        (usuario_rol, usuario_estado, usuario_id_actual)
+                    )
+                if usuario_pass:
+                    from werkzeug.security import generate_password_hash
+                    cursor.execute(
+                        "UPDATE usuarios SET password=%s, updated_at=NOW() WHERE id=%s",
+                        (generate_password_hash(usuario_pass), usuario_id_actual)
+                    )
+            else:
+                # crear nuevo usuario y vincular
+                if not usuario_nombre or not usuario_pass:
+                    cursor.close(); conexion.close()
+                    return jsonify({"estado": "error", "mensaje": "Para dar acceso nuevo, nombre de usuario y contraseña son obligatorios."}), 400
+                cursor.execute("SELECT id FROM usuarios WHERE usuario=%s LIMIT 1", (usuario_nombre,))
+                if cursor.fetchone():
+                    cursor.close(); conexion.close()
+                    return jsonify({"estado": "error", "mensaje": f"El nombre de usuario '{usuario_nombre}' ya está en uso."}), 400
+                from werkzeug.security import generate_password_hash
+                cursor.execute("""
+                    INSERT INTO usuarios
+                        (nombres, apellidos, cedula, correo, usuario, password, rol, estado, created_at, updated_at)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
+                """, (nombres, apellidos, cedula or None, correo or None,
+                      usuario_nombre, generate_password_hash(usuario_pass),
+                      usuario_rol, usuario_estado))
+                nuevo_usuario_id = cursor.lastrowid
+
+        else:
+            # dar_acceso = False: si el funcionario tenía cuenta vinculada,
+            # desvincular area_personal.usuario_id y desactivar la cuenta de usuarios.
+            if usuario_id_actual:
+                cursor.execute(
+                    "UPDATE usuarios SET estado='inactivo', updated_at=NOW() WHERE id=%s",
+                    (usuario_id_actual,)
+                )
+                nuevo_usuario_id = None  # romper el vínculo
+
+        cursor.execute("""
+            UPDATE area_personal
+            SET area_id=%s, nombres=%s, apellidos=%s, cedula=%s, correo=%s,
+                cargo=%s, tipo_responsable=%s, estado=%s, usuario_id=%s, updated_at=NOW()
+            WHERE id=%s
+        """, (area_id, nombres, apellidos, cedula or None, correo or None,
+              cargo, tipo, estado, nuevo_usuario_id, funcionario_id))
+
         conexion.commit()
         cursor.close()
         conexion.close()
         return jsonify({"estado": "ok", "mensaje": "Funcionario actualizado correctamente."}), 200
     except Exception as e:
+        try: conexion.rollback()
+        except Exception: pass
         return jsonify({"estado": "error", "mensaje": str(e)}), 500
 
 
@@ -7560,28 +7735,28 @@ def obtener_jefe_por_area_publica(area_id):
             where area_id = %s
               and tipo_responsable = 'jefe_area'
               and estado = 'activo'
-            order by id asc
-            limit 1;
+            order by id asc;
         """, (area_id,))
 
-        jefe = cursor.fetchone()
+        jefes = cursor.fetchall()
 
         cursor.close()
         conexion.close()
 
-        if jefe is None:
+        if not jefes:
             return jsonify({
                 "estado": "error",
                 "mensaje": "no existe un jefe asignado para esta área.",
                 "area_id": area_id,
-                "jefe": None
+                "jefes": []
             }), 404
 
         return jsonify({
             "estado": "ok",
-            "mensaje": "jefe asignado obtenido correctamente.",
+            "mensaje": "jefes del área obtenidos correctamente.",
             "area_id": area_id,
-            "jefe": jefe
+            "jefes": jefes,
+            "jefe": jefes[0]
         }), 200
 
     except Error as error:
@@ -8825,14 +9000,14 @@ def _firmar_pdf_pyhanko(ruta_pdf_entrada, ruta_pdf_salida, ruta_cert, password_b
         # Estilo QR: nombre del firmante + timestamp + QR de verificación
         from pyhanko.pdf_utils.layout import SimpleBoxLayoutRule, AxisAlignment, Margins, InnerScaling
         stamp_style = QRStampStyle(
-            stamp_text="Firmado electrónicamente por:\n%(signer)s",
-            text_box_style=TextBoxStyle(font_size=6),
+            stamp_text="Firmado electrónicamente por:\n%(nombre_upper)s",
+            text_box_style=TextBoxStyle(font_size=7),
             background=None,
             background_opacity=0,
             border_width=0,
             innsep=3,
             qr_position=QRPosition.LEFT_OF_TEXT,
-            qr_inner_size=42,   # QR 42pt (~1.5 cm) — deja ~75pt para el texto
+            qr_inner_size=42,   # QR 42pt (~1.5 cm)
             background_layout=SimpleBoxLayoutRule(
                 x_align=AxisAlignment.ALIGN_MIN,
                 y_align=AxisAlignment.ALIGN_MID,
@@ -8867,14 +9042,19 @@ def _firmar_pdf_pyhanko(ruta_pdf_entrada, ruta_pdf_salida, ruta_cert, password_b
                     pdf_signer.async_sign_pdf(
                         w,
                         output=pdf_out,
-                        appearance_text_params={"url": url_qr or nombre_firmante or "INAMHI"},
+                        appearance_text_params={
+                            "url": url_qr or nombre_firmante or "INAMHI",
+                            "nombre_upper": (nombre_firmante or "Firma Electrónica").upper()
+                        },
                     )
                 )
 
         return True, "ok"
 
     except Exception as e:
-        import traceback; traceback.print_exc()
+        import traceback
+        with open("pyhanko_error.log", "w") as f:
+            f.write(traceback.format_exc())
         return False, f"Error al firmar: {str(e)}"
 
 
@@ -9410,7 +9590,7 @@ def firmar_pdf_con_pyhanko(solicitud_id):
                 "solicitud_id": solicitud_id,
                 "tipo_documento": "pdf_firmado_electronico",
                 "nombre_archivo": nombre_pdf_firmado,
-                "rol_firmante": rol_actual,
+                "rol_firmante": rol_firmante,
                 "etapa": solicitud["etapa_actual"],
                 "firmado": True,
                 "firma_validada": True

@@ -60,6 +60,7 @@ interface JefeResponse {
   estado: string;
   mensaje?: string;
   jefe?: JefeAsignado | null;
+  jefes?: JefeAsignado[];
 }
 
 interface PrepararFirmaResponse {
@@ -164,6 +165,7 @@ export class SolicitudPublica implements OnInit {
   cargos: Cargo[] = [];
 
   jefeAsignado: JefeAsignado | null = null;
+  jefesDisponibles: JefeAsignado[] = [];
 
   nombreDireccionSeleccionada = '';
   nombreAreaSeleccionada = '';
@@ -370,6 +372,7 @@ export class SolicitudPublica implements OnInit {
     this.areas = [];
     this.cargos = [];
     this.jefeAsignado = null;
+    this.jefesDisponibles = [];
 
     this.nombreDireccionSeleccionada = '';
     this.nombreAreaSeleccionada = '';
@@ -427,6 +430,7 @@ export class SolicitudPublica implements OnInit {
 
     this.cargos = [];
     this.jefeAsignado = null;
+    this.jefesDisponibles = [];
 
     this.nombreAreaSeleccionada = '';
     this.nombreCargoSeleccionado = '';
@@ -481,6 +485,8 @@ export class SolicitudPublica implements OnInit {
   cargarJefePorArea(areaId: number): void {
     this.cargandoJefe = true;
     this.errorGeneral = '';
+    this.jefesDisponibles = [];
+    this.jefeAsignado = null;
 
     this.http.get<JefeResponse>(
       `${this.API_BASE}/public/catalogos/areas/${areaId}/jefe`
@@ -489,19 +495,22 @@ export class SolicitudPublica implements OnInit {
         this.cargandoJefe = false;
 
         if (response.estado !== 'ok') {
-          this.jefeAsignado = null;
           this.errorGeneral = response.mensaje || 'No existe jefe configurado para el área seleccionada.';
           return;
         }
 
-        this.jefeAsignado = response.jefe || null;
+        this.jefesDisponibles = response.jefes || (response.jefe ? [response.jefe] : []);
 
-        if (!this.jefeAsignado) {
+        if (this.jefesDisponibles.length === 0) {
           this.errorGeneral = 'No existe jefe configurado para el área seleccionada.';
+        } else if (this.jefesDisponibles.length === 1) {
+          this.jefeAsignado = this.jefesDisponibles[0];
         }
+        // Si hay 2+, el usuario deberá seleccionar manualmente
       },
       error: (err) => {
         this.cargandoJefe = false;
+        this.jefesDisponibles = [];
         this.jefeAsignado = null;
 
         if (err.status === 0) {
@@ -514,6 +523,10 @@ export class SolicitudPublica implements OnInit {
           'No se pudo obtener el jefe asignado del área seleccionada.';
       }
     });
+  }
+
+  seleccionarJefe(jefeId: number): void {
+    this.jefeAsignado = this.jefesDisponibles.find(j => j.id === jefeId) || null;
   }
 
   onCargoSeleccionado(): void {

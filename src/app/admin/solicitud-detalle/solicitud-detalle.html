@@ -17,7 +17,6 @@
         <a routerLink="/admin/dashboard" routerLinkActive="active"
            [routerLinkActiveOptions]="{ exact: true }">Dashboard</a>
         <a routerLink="/admin/solicitudes" routerLinkActive="active">Solicitudes</a>
-        <a routerLink="/admin/usuarios" routerLinkActive="active">Usuarios</a>
         <a routerLink="/admin/funcionarios" routerLinkActive="active">Funcionarios</a>
         <a routerLink="/admin/reportes" routerLinkActive="active">Reportes</a>
         <a routerLink="/admin/auditoria" routerLinkActive="active">Auditoría</a>
@@ -62,7 +61,7 @@
 
         <p>
           Consulte la información completa, revise documentos cargados y continúe
-          el flujo mediante firma electrónica con FirmaEC.
+          el flujo mediante firma digital con certificado .p12/.pfx.
         </p>
       </div>
 
@@ -147,24 +146,24 @@
         <div class="process-step">
           <div class="process-step-num">1</div>
           <div class="process-step-body">
-            <strong>Descargar</strong>
-            <span>Descargue el PDF firmado actual desde la sección de acciones.</span>
+            <strong>Revisar</strong>
+            <span>Descargue o visualice el PDF actual desde la sección de acciones.</span>
           </div>
         </div>
         <div class="process-step-arrow">→</div>
         <div class="process-step">
           <div class="process-step-num">2</div>
           <div class="process-step-body">
-            <strong>Firmar con FirmaEC</strong>
-            <span>Abra el PDF en la aplicación FirmaEC de su equipo y fírmelo electrónicamente.</span>
+            <strong>Firmar</strong>
+            <span>Use su certificado .p12/.pfx para aplicar la firma digital directamente en el sistema.</span>
           </div>
         </div>
         <div class="process-step-arrow">→</div>
         <div class="process-step">
           <div class="process-step-num">3</div>
           <div class="process-step-body">
-            <strong>Subir</strong>
-            <span>Suba el PDF firmado para avanzar con el proceso.</span>
+            <strong>Aprobar / Rechazar</strong>
+            <span>Una vez firmado, apruebe para avanzar el proceso o rechace si corresponde.</span>
           </div>
         </div>
       </div>
@@ -251,7 +250,7 @@
             <div class="document-info">
               <span>Paso 2 — Firma digital</span>
               <h4>Firmar electrónicamente</h4>
-              <p class="card-desc">pyHanko (.p12/.pfx) o FirmaEC</p>
+              <p class="card-desc">Certificado .p12/.pfx</p>
             </div>
             <button
               type="button"
@@ -269,7 +268,7 @@
         <!-- Estados de advertencia y éxito -->
         <div class="document-warning" *ngIf="solicitud.estado === 'pendiente_jefe_inmediato' && !jefeHaSubidoDocumento">
           <i class="bi bi-exclamation-triangle-fill"></i>
-          Debe subir el PDF firmado con FirmaEC. La solicitud pasará automáticamente a Máxima Autoridad.
+          Debe firmar el PDF con su certificado digital antes de aprobar.
         </div>
 
         <div class="document-warning" *ngIf="solicitud.estado === 'pendiente_maxima_autoridad' && !autoridadHaSubidoDocumento">
@@ -530,126 +529,7 @@
 
       
       <!-- =====================================================
-           MODAL FIRMA ELECTRÓNICA FIRMAEC
-      ====================================================== -->
-
-      <div
-        class="modal-backdrop-firmaec"
-        *ngIf="mostrarModalFirmaElectronica"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="modal-firmaec-titulo"
-      >
-        <section class="modal-firmaec-card">
-          <button
-            type="button"
-            class="close-modal-firmaec"
-            (click)="cerrarModalFirmaElectronica()"
-            [disabled]="procesando"
-            aria-label="Cerrar modal FirmaEC"
-          >
-            ×
-          </button>
-
-          <div class="firmaec-modal-header">
-            <div class="firmaec-modal-icon">
-              <i class="bi bi-shield-lock-fill"></i>
-            </div>
-
-            <div>
-              <span>Firma electrónica</span>
-              <h3 id="modal-firmaec-titulo">Subir PDF firmado</h3>
-              <p>Seleccione el PDF que firmó electrónicamente con FirmaEC.</p>
-            </div>
-          </div>
-
-          <label class="firmaec-upload-zone">
-            <input
-              type="file"
-              accept=".pdf,application/pdf"
-              [disabled]="procesando"
-              (change)="seleccionarArchivoFirmadoElectronico($event)"
-            />
-
-            <i class="bi bi-cloud-arrow-up-fill"></i>
-
-            <strong>
-              {{ nombreArchivoFirmadoElectronico || 'Seleccionar PDF firmado electrónicamente' }}
-            </strong>
-
-            <span>Solo PDF · Máximo 15 MB</span>
-          </label>
-
-          <div
-            class="preview-actions"
-            *ngIf="archivoFirmadoElectronico"
-          >
-            <button
-              type="button"
-              class="preview-btn"
-              (click)="verPdfFirmadoElectronico()"
-              [disabled]="procesando"
-            >
-              <i class="bi bi-eye-fill"></i>
-              Ver PDF seleccionado
-            </button>
-
-            <button
-              type="button"
-              class="remove-selected-btn"
-              (click)="quitarPdfFirmadoElectronico()"
-              [disabled]="procesando"
-            >
-              <i class="bi bi-trash-fill"></i>
-              Quitar PDF
-            </button>
-          </div>
-
-          <div
-            class="firmaec-error"
-            *ngIf="error"
-          >
-            {{ error }}
-          </div>
-
-          <div
-            class="firmaec-success"
-            *ngIf="mensajeOk"
-          >
-            {{ mensajeOk }}
-          </div>
-
-          <div class="firmaec-final-actions">
-            <button
-              type="button"
-              class="cancel-modal-btn"
-              (click)="cerrarModalFirmaElectronica()"
-              [disabled]="procesando"
-            >
-              Cancelar
-            </button>
-
-            <button
-              type="button"
-              class="send-firmaec-btn"
-              (click)="subirFirmaElectronica()"
-              [disabled]="procesando || !archivoFirmadoElectronico"
-            >
-              <span *ngIf="!procesando">
-                <i class="bi bi-send-check-fill"></i>
-                Enviar PDF firmado
-              </span>
-
-              <span *ngIf="procesando">
-                Enviando PDF firmado...
-              </span>
-            </button>
-          </div>
-        </section>
-      </div>
-
-      <!-- =====================================================
-           MODAL FIRMA DIGITAL — DUAL MODE (pyHanko / FirmaEC)
+           MODAL FIRMA DIGITAL CON CERTIFICADO (.p12/.pfx)
       ====================================================== -->
 
       <div
@@ -685,35 +565,6 @@
             </button>
           </div>
 
-          <!-- Selector de modo -->
-          <div class="fd-mode-tabs">
-            <button
-              type="button"
-              class="fd-mode-tab"
-              [class.active]="modoFirma === 'pyhanko'"
-              (click)="cambiarModoFirma('pyhanko')"
-              [disabled]="validandoCertificado || firmandoConCertificado"
-            >
-              <i class="bi bi-key-fill"></i>
-              Certificado .p12/.pfx
-              <span class="fd-mode-badge">Recomendado</span>
-            </button>
-            <button
-              type="button"
-              class="fd-mode-tab"
-              [class.active]="modoFirma === 'firmaec'"
-              (click)="cambiarModoFirma('firmaec')"
-              [disabled]="validandoCertificado || firmandoConCertificado"
-            >
-              <i class="bi bi-cloud-arrow-up-fill"></i>
-              FirmaEC (subir PDF)
-            </button>
-          </div>
-
-          <!-- ══════════════════════════════════════
-               MODO 1 — pyHanko (.p12/.pfx)
-          ══════════════════════════════════════ -->
-          @if (modoFirma === 'pyhanko') {
           <div class="fd-body">
 
             <!-- YA FIRMÓ ESTE ROL -->
@@ -921,117 +772,6 @@
             }<!-- /formulario -->
 
           </div>
-          }<!-- /modo pyhanko -->
-
-          <!-- ══════════════════════════════════════
-               MODO 2 — FirmaEC (subir PDF externo)
-          ══════════════════════════════════════ -->
-          <div class="fd-body" *ngIf="modoFirma === 'firmaec'">
-
-            <div class="fd-info-row">
-              <div class="fd-info-item">
-                <span>Documento</span>
-                <strong>{{ solicitud?.codigo_solicitud }}.pdf</strong>
-              </div>
-              <div class="fd-info-item">
-                <span>Rol</span>
-                <strong>{{ getMiRolTexto() }}</strong>
-              </div>
-            </div>
-
-            <div class="fd-guide">
-              <div class="fd-guide-step">
-                <span class="fd-guide-num">1</span>
-                <div>
-                  <strong>Descargar el PDF</strong>
-                  <p>Use el botón "Descargar" del panel de acciones para obtener el PDF actual.</p>
-                </div>
-              </div>
-              <div class="fd-guide-arrow">→</div>
-              <div class="fd-guide-step">
-                <span class="fd-guide-num">2</span>
-                <div>
-                  <strong>Firmar con FirmaEC</strong>
-                  <p>Abra el PDF en la aplicación FirmaEC de su equipo y fírmelo con su certificado.</p>
-                </div>
-              </div>
-              <div class="fd-guide-arrow">→</div>
-              <div class="fd-guide-step">
-                <span class="fd-guide-num">3</span>
-                <div>
-                  <strong>Subir PDF firmado</strong>
-                  <p>Seleccione abajo el PDF ya firmado por FirmaEC.</p>
-                </div>
-              </div>
-            </div>
-
-            <!-- Zona de subida -->
-            <div class="fd-field">
-              <label class="fd-label">
-                <i class="bi bi-file-earmark-pdf-fill"></i>
-                PDF firmado con FirmaEC *
-              </label>
-              <label class="fd-upload-zone" [class.has-file]="archivoFirmadoElectronico">
-                <input
-                  type="file"
-                  accept=".pdf,application/pdf"
-                  (change)="seleccionarArchivoFirmadoElectronico($event)"
-                  [disabled]="procesando"
-                />
-                <i class="bi" [ngClass]="archivoFirmadoElectronico ? 'bi-file-earmark-check-fill' : 'bi-cloud-arrow-up'"></i>
-                <strong>{{ nombreArchivoFirmadoElectronico || 'Seleccionar PDF firmado con FirmaEC' }}</strong>
-                <span>Solo PDF · Máximo 15 MB</span>
-              </label>
-            </div>
-
-            <!-- Acciones del PDF seleccionado -->
-            <div class="fd-preview-actions" *ngIf="archivoFirmadoElectronico">
-              <button type="button" class="fd-btn-outline sm" (click)="verPdfFirmadoElectronico()" [disabled]="procesando">
-                <i class="bi bi-eye-fill"></i> Ver PDF
-              </button>
-              <button type="button" class="fd-btn-danger sm" (click)="quitarPdfFirmadoElectronico()" [disabled]="procesando">
-                <i class="bi bi-trash-fill"></i> Quitar
-              </button>
-            </div>
-
-            <div class="fd-alert fd-alert-error" *ngIf="error">
-              <i class="bi bi-exclamation-triangle-fill"></i>
-              {{ error }}
-            </div>
-
-            <div class="fd-alert fd-alert-success" *ngIf="mensajeOk">
-              <i class="bi bi-check-circle-fill"></i>
-              {{ mensajeOk }}
-            </div>
-
-            <!-- Botones FirmaEC -->
-            <div class="fd-actions">
-              <button
-                type="button"
-                class="fd-btn-secondary"
-                (click)="cerrarModalFirmaDigital()"
-                [disabled]="procesando"
-              >
-                Cancelar
-              </button>
-              <button
-                type="button"
-                class="fd-btn-primary"
-                (click)="subirFirmaElectronica()"
-                [disabled]="procesando || !archivoFirmadoElectronico"
-              >
-                <span *ngIf="!procesando">
-                  <i class="bi bi-send-check-fill"></i>
-                  Enviar PDF firmado
-                </span>
-                <span *ngIf="procesando" class="fd-signing">
-                  <span class="fd-spinner"></span>
-                  Enviando...
-                </span>
-              </button>
-            </div>
-
-          </div><!-- /modo firmaec -->
 
           <!-- ══════════════════════════════════════
                HISTORIAL DE FIRMAS

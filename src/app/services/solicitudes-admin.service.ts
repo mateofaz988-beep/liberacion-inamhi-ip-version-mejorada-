@@ -298,29 +298,6 @@ export class SolicitudesAdminService {
   }
 
   /* =====================================================
-     SUBIR PDF FIRMADO CON FIRMAEC
-     Todos los roles usan /documentos (no auto-avanza el estado).
-     El estado avanza solo cuando el rol presiona "Aprobar".
-  ===================================================== */
-
-  subirPdfFirmadoElectronico(
-    solicitudId: number,
-    archivo: File,
-    _rolFirmante?: RolFirmante
-  ): Observable<SubirDocumentoResponse> {
-    const params = new URLSearchParams({
-      tipo_documento: 'pdf_firmado_electronico',
-      nombre_archivo: archivo.name || 'documento.pdf'
-    }).toString();
-
-    return this.http.post<SubirDocumentoResponse>(
-      `${this.API_URL}/${solicitudId}/documentos?${params}`,
-      archivo,
-      { headers: this.getHeaders().set('Content-Type', 'application/octet-stream') }
-    );
-  }
-
-  /* =====================================================
      SUBIR PDF FIRMADO (admin — cualquier tipo)
      Útil para cargas manuales del administrador.
   ===================================================== */

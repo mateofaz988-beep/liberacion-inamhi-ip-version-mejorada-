@@ -9,7 +9,6 @@
     <nav class="menu">
       <a routerLink="/admin/dashboard"    routerLinkActive="active"><i class="bi bi-speedometer2"></i> Dashboard</a>
       <a routerLink="/admin/solicitudes"  routerLinkActive="active"><i class="bi bi-file-earmark-text-fill"></i> Solicitudes</a>
-      <a routerLink="/admin/usuarios"     routerLinkActive="active"><i class="bi bi-people"></i> Usuarios</a>
       <a routerLink="/admin/funcionarios" routerLinkActive="active"><i class="bi bi-person-badge-fill"></i> Funcionarios</a>
       <a routerLink="/admin/reportes"     routerLinkActive="active"><i class="bi bi-bar-chart-fill"></i> Reportes</a>
       <a routerLink="/admin/auditoria"    routerLinkActive="active"><i class="bi bi-shield-lock-fill"></i> Auditoría</a>
@@ -103,7 +102,21 @@
             </tr></thead>
             <tbody>
               <tr *ngFor="let f of funcionariosFiltrados">
-                <td><strong>{{ f.nombres }} {{ f.apellidos }}</strong><span *ngIf="f.usuario_sistema">@{{ f.usuario_sistema }}</span></td>
+                <td>
+                  <strong>{{ f.nombres }} {{ f.apellidos }}</strong>
+                  <span *ngIf="f.usuario_sistema" class="usuario-inline">@{{ f.usuario_sistema }}</span>
+                  <span *ngIf="f.usuario_id" class="acceso-badge"
+                    [ngClass]="{
+                      'acceso-badge--activo':   f.usuario_estado === 'activo',
+                      'acceso-badge--inactivo': f.usuario_estado === 'inactivo'
+                    }">
+                    <i class="bi" [ngClass]="f.usuario_estado === 'activo' ? 'bi-shield-fill-check' : 'bi-shield-slash-fill'"></i>
+                    {{ f.usuario_rol === 'administrador' ? 'Admin' :
+                       f.usuario_rol === 'jefe_inmediato' ? 'Jefe' :
+                       f.usuario_rol === 'maxima_autoridad' ? 'Autoridad' :
+                       f.usuario_rol === 'analista_tics' ? 'TICS' : f.usuario_rol }}
+                  </span>
+                </td>
                 <td><strong *ngIf="f.cedula">{{ f.cedula }}</strong><strong *ngIf="!f.cedula" class="muted">—</strong><span *ngIf="f.correo">{{ f.correo }}</span></td>
                 <td>{{ f.direccion_nombre || '—' }}</td>
                 <td>{{ f.area_nombre || '—' }}</td>
@@ -113,6 +126,16 @@
                 <td class="actions-cell">
                   <button type="button" class="edit-btn"   (click)="abrirEditarFunc(f)"><i class="bi bi-pencil-fill"></i></button>
                   <button type="button" class="delete-btn" (click)="confirmarElimFunc(f)"><i class="bi bi-trash-fill"></i></button>
+                  <button
+                    *ngIf="f.usuario_id"
+                    type="button"
+                    class="toggle-acceso-btn"
+                    [ngClass]="f.usuario_estado === 'activo' ? 'toggle-acceso-btn--on' : 'toggle-acceso-btn--off'"
+                    (click)="toggleAccesoCuenta(f)"
+                    [title]="f.usuario_estado === 'activo' ? 'Desactivar acceso' : 'Activar acceso'"
+                  >
+                    <i class="bi" [ngClass]="f.usuario_estado === 'activo' ? 'bi-toggle-on' : 'bi-toggle-off'"></i>
+                  </button>
                 </td>
               </tr>
             </tbody>
@@ -309,6 +332,52 @@
         </label>
         <label>Estado *<select [(ngModel)]="formFunc.estado" name="fest"><option value="activo">Activo</option><option value="inactivo">Inactivo</option></select></label>
       </div>
+
+      <!-- ── Acceso al sistema ─────────────────── -->
+      <div class="acceso-section">
+        <label class="acceso-toggle-label">
+          <input type="checkbox" [(ngModel)]="formFunc.dar_acceso" name="fdarAcceso" (change)="formFunc.dar_acceso && !formFunc.usuario_nombre && generarUsuarioSugerido()" />
+          <span class="acceso-toggle-text">
+            <i class="bi bi-person-badge-fill"></i>
+            {{ modoEdFunc && formFunc.dar_acceso ? 'Tiene acceso al sistema' : 'Dar acceso al sistema' }}
+          </span>
+        </label>
+
+        <div class="acceso-fields" *ngIf="formFunc.dar_acceso">
+          <div class="form-grid">
+            <label>Usuario *
+              <div style="display:flex;gap:6px">
+                <input type="text" [(ngModel)]="formFunc.usuario_nombre" name="fusuario" placeholder="ej. jperez" maxlength="60" style="flex:1" />
+                <button type="button" class="gen-btn" (click)="generarUsuarioSugerido()" title="Generar automáticamente">
+                  <i class="bi bi-magic"></i>
+                </button>
+              </div>
+              <small class="field-error" *ngIf="erroresFunc['usuario_nombre']">{{ erroresFunc['usuario_nombre'] }}</small>
+            </label>
+            <label>
+              Contraseña {{ modoEdFunc ? '(dejar vacío para no cambiar)' : '*' }}
+              <input type="password" [(ngModel)]="formFunc.usuario_password" name="fpass" placeholder="{{ modoEdFunc ? 'Sin cambios' : 'Nueva contraseña' }}" maxlength="128" autocomplete="new-password" />
+              <small class="field-error" *ngIf="erroresFunc['usuario_password']">{{ erroresFunc['usuario_password'] }}</small>
+            </label>
+            <label>Rol del sistema *
+              <select [(ngModel)]="formFunc.usuario_rol" name="frol">
+                <option value="jefe_inmediato">Jefe inmediato</option>
+                <option value="maxima_autoridad">Máxima autoridad</option>
+                <option value="analista_tics">Analista TICS</option>
+                <option value="administrador">Administrador</option>
+              </select>
+              <small class="field-error" *ngIf="erroresFunc['usuario_rol']">{{ erroresFunc['usuario_rol'] }}</small>
+            </label>
+            <label>Estado del usuario *
+              <select [(ngModel)]="formFunc.usuario_estado" name="fuestado">
+                <option value="activo">Activo</option>
+                <option value="inactivo">Inactivo</option>
+              </select>
+            </label>
+          </div>
+        </div>
+      </div>
+
       <div class="form-actions">
         <button type="button" class="cancel-btn" (click)="cerrarModalFunc()" [disabled]="guardandoFunc">Cancelar</button>
         <button type="submit" class="save-btn" [disabled]="guardandoFunc">

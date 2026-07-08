@@ -1,4 +1,4 @@
-﻿:host {
+:host {
   display: block;
   height: 100vh;
   overflow: hidden;
@@ -708,6 +708,68 @@ tbody tr:last-child td { border-bottom: none; }
 .edit-btn:hover  { transform: translateY(-2px); filter: brightness(1.07); }
 .delete-btn:hover { transform: translateY(-2px); filter: brightness(1.07); }
 
+/* Badge de acceso al sistema (rol + estado) */
+.usuario-inline {
+  display: block;
+  font-size: 11px;
+  color: #64748b;
+  margin-top: 2px;
+}
+
+.acceso-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  padding: 2px 8px;
+  border-radius: 99px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+
+  &--activo {
+    color: #065f46;
+    background: #d1fae5;
+    border: 1px solid #6ee7b7;
+  }
+
+  &--inactivo {
+    color: #78350f;
+    background: #fef3c7;
+    border: 1px solid #fcd34d;
+  }
+}
+
+/* Botón toggle rápido de acceso */
+.toggle-acceso-btn {
+  border: none;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 34px;
+  width: 34px;
+  border-radius: 11px;
+  font-size: 16px;
+  transition: transform 0.2s ease, filter 0.2s ease, box-shadow 0.2s ease;
+
+  &--on {
+    color: #065f46;
+    background: linear-gradient(135deg, #d1fae5, #a7f3d0);
+    box-shadow: 0 4px 12px rgba(6,95,70,.18);
+    &:hover { transform: translateY(-2px); filter: brightness(0.95); }
+  }
+
+  &--off {
+    color: #78350f;
+    background: linear-gradient(135deg, #fef3c7, #fde68a);
+    box-shadow: 0 4px 12px rgba(120,53,15,.14);
+    &:hover { transform: translateY(-2px); filter: brightness(0.95); }
+  }
+}
+
+
 /* =====================================================
    MODAL — BACKDROP
 ===================================================== */
@@ -922,6 +984,58 @@ tbody tr:last-child td { border-bottom: none; }
 
 .save-btn:hover:not(:disabled) { transform: translateY(-2px); filter: brightness(1.06); }
 .save-btn:disabled { opacity: 0.55; cursor: not-allowed; box-shadow: none; }
+
+/* =====================================================
+   SECCIÓN ACCESO AL SISTEMA
+===================================================== */
+
+.acceso-section {
+  margin-top: 18px;
+  border-top: 1.5px dashed #e2e8f0;
+  padding-top: 16px;
+}
+
+.acceso-toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 14px;
+  font-weight: 700;
+  color: #334155;
+
+  input[type="checkbox"] {
+    width: 18px;
+    height: 18px;
+    accent-color: #1d4ed8;
+    cursor: pointer;
+  }
+}
+
+.acceso-toggle-text i { color: #1d4ed8; }
+
+.acceso-fields {
+  margin-top: 14px;
+  padding: 14px;
+  background: #f0f6ff;
+  border-radius: 12px;
+  border: 1.5px solid #bfdbfe;
+}
+
+.gen-btn {
+  border: 1.5px solid #cbd5e1;
+  background: #f8fafc;
+  border-radius: 8px;
+  padding: 0 12px;
+  height: 100%;
+  cursor: pointer;
+  color: #1d4ed8;
+  font-size: 15px;
+  transition: background 0.18s;
+
+  &:hover { background: #dbeafe; }
+}
 
 /* =====================================================
    MODAL CONFIRMACIÓN

@@ -1,4 +1,4 @@
-﻿import { CommonModule } from '@angular/common';
+import { CommonModule } from '@angular/common';
 import { HttpClient, HttpHeaders } from '@angular/common/http';
 import { Component, OnInit } from '@angular/core';
 import { FormsModule } from '@angular/forms';
@@ -20,6 +20,7 @@ export interface Funcionario {
   area_id: number; area_nombre: string;
   direccion_id: number; direccion_nombre: string;
   usuario_id: number | null; usuario_sistema: string | null;
+  usuario_rol: string | null; usuario_estado: string | null;
   created_at: string; updated_at: string;
 }
 
@@ -235,10 +236,17 @@ export class Funcionarios implements OnInit {
   }
 
   abrirEditarFunc(f: Funcionario): void {
-    this.formFunc = { id: f.id, nombres: f.nombres, apellidos: f.apellidos,
+    this.formFunc = {
+      id: f.id, nombres: f.nombres, apellidos: f.apellidos,
       cedula: f.cedula ?? '', correo: f.correo ?? '', cargo: f.cargo,
       tipo_responsable: f.tipo_responsable, area_id: f.area_id,
-      direccion_id: f.direccion_id, estado: f.estado };
+      direccion_id: f.direccion_id, estado: f.estado,
+      dar_acceso: !!f.usuario_id,
+      usuario_nombre: f.usuario_sistema ?? '',
+      usuario_password: '',
+      usuario_rol: (f.usuario_rol as any) ?? 'jefe_inmediato',
+      usuario_estado: (f.usuario_estado as any) ?? 'activo'
+    };
     this.areasFormArea = f.direccion_id
       ? this.catAreas.filter(a => a.direccion_id === f.direccion_id)
       : [...this.catAreas];
@@ -253,6 +261,16 @@ export class Funcionarios implements OnInit {
     this.formFunc.area_id = null;
   }
 
+  generarUsuarioSugerido(): void {
+    const nombres = this.formFunc.nombres?.trim() || '';
+    const apellidos = this.formFunc.apellidos?.trim() || '';
+    if (!nombres || !apellidos) return;
+    const primeraLetra = nombres.charAt(0).toLowerCase().replace(/[^a-z]/g, '');
+    const primerApellido = apellidos.split(/\s+/)[0].toLowerCase()
+      .normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z]/g, '');
+    this.formFunc.usuario_nombre = primeraLetra + primerApellido;
+  }
+
   guardarFunc(): void {
     this.erroresFunc = {};
     if (!this.formFunc.nombres?.trim() || this.formFunc.nombres.trim().length < 2) this.erroresFunc['nombres'] = 'Mínimo 2 caracteres.';
@@ -261,10 +279,17 @@ export class Funcionarios implements OnInit {
     if (!this.formFunc.area_id) this.erroresFunc['area_id'] = 'Seleccione un área.';
     if (this.formFunc.cedula && !/^\d{10}$/.test(this.formFunc.cedula)) this.erroresFunc['cedula'] = 'La cédula debe tener 10 dígitos.';
     if (this.formFunc.correo && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(this.formFunc.correo)) this.erroresFunc['correo'] = 'Correo inválido.';
+
+    if (this.formFunc.dar_acceso) {
+      if (!this.formFunc.usuario_nombre?.trim()) this.erroresFunc['usuario_nombre'] = 'El nombre de usuario es requerido.';
+      if (!this.modoEdFunc && !this.formFunc.usuario_password?.trim()) this.erroresFunc['usuario_password'] = 'La contraseña es requerida.';
+      if (!this.formFunc.usuario_rol) this.erroresFunc['usuario_rol'] = 'Seleccione un rol.';
+    }
+
     if (Object.keys(this.erroresFunc).length) return;
 
     this.guardandoFunc = true;
-    const payload = {
+    const payload: any = {
       nombres: this.formFunc.nombres.trim().toUpperCase(),
       apellidos: this.formFunc.apellidos.trim().toUpperCase(),
       cedula: this.formFunc.cedula?.trim() || null,
@@ -272,7 +297,12 @@ export class Funcionarios implements OnInit {
       cargo: this.formFunc.cargo.trim().toUpperCase(),
       tipo_responsable: this.formFunc.tipo_responsable,
       area_id: Number(this.formFunc.area_id),
-      estado: this.formFunc.estado
+      estado: this.formFunc.estado,
+      dar_acceso: this.formFunc.dar_acceso,
+      usuario_nombre: this.formFunc.dar_acceso ? this.formFunc.usuario_nombre?.trim() : undefined,
+      usuario_password: this.formFunc.dar_acceso && this.formFunc.usuario_password ? this.formFunc.usuario_password : undefined,
+      usuario_rol: this.formFunc.dar_acceso ? this.formFunc.usuario_rol : undefined,
+      usuario_estado: this.formFunc.dar_acceso ? this.formFunc.usuario_estado : undefined
     };
     const es_ed = this.modoEdFunc && this.formFunc.id != null;
     const url = es_ed ? `${this.API}/admin/funcionarios/${this.formFunc.id}` : `${this.API}/admin/funcionarios`;
@@ -293,6 +323,38 @@ export class Funcionarios implements OnInit {
     this.http.delete<any>(`${this.API}/admin/funcionarios/${this.itemElimFunc.id}`, { headers: this.h() }).subscribe({
       next: r => { this.cancelarElimFunc(); if (r.estado === 'ok') { this.cargarFuncionarios(); this.ok(r.mensaje); } },
       error: err => { this.cancelarElimFunc(); this.err(err.error?.mensaje || 'Error al eliminar.'); }
+    });
+  }
+
+  /** Activa o desactiva la cuenta de sistema del funcionario sin abrir el modal completo */
+  toggleAccesoCuenta(f: Funcionario): void {
+    if (!f.usuario_id) return;
+    const nuevoEstado: 'activo' | 'inactivo' = f.usuario_estado === 'activo' ? 'inactivo' : 'activo';
+    const accion = nuevoEstado === 'activo' ? 'activar' : 'desactivar';
+    Swal.fire({
+      title: `¿${accion.charAt(0).toUpperCase() + accion.slice(1)} acceso?`,
+      text: `Se ${accion}á la cuenta "${f.usuario_sistema}" de ${f.nombres} ${f.apellidos}.`,
+      icon: 'warning',
+      showCancelButton: true,
+      confirmButtonText: accion.charAt(0).toUpperCase() + accion.slice(1),
+      cancelButtonText: 'Cancelar',
+      confirmButtonColor: nuevoEstado === 'activo' ? '#15803d' : '#dc2626',
+      background: '#ffffff', color: '#0f172a'
+    }).then(result => {
+      if (!result.isConfirmed) return;
+      this.http.put<any>(
+        `${this.API}/admin/usuarios/${f.usuario_id}/estado`,
+        { estado: nuevoEstado },
+        { headers: this.h() }
+      ).subscribe({
+        next: r => {
+          if (r.estado === 'ok') {
+            f.usuario_estado = nuevoEstado;
+            this.ok(`Acceso ${nuevoEstado === 'activo' ? 'activado' : 'desactivado'} correctamente.`);
+          }
+        },
+        error: err => this.err(err.error?.mensaje || 'Error al cambiar estado del acceso.')
+      });
     });
   }
 
@@ -562,7 +624,20 @@ export class Funcionarios implements OnInit {
 
   // ── formas vacías ─────────────────────────────────
   private funcVacio() {
-    return { id: null as number | null, nombres: '', apellidos: '', cedula: '', correo: '', cargo: '', tipo_responsable: 'funcionario', area_id: null as number | null, direccion_id: null as number | null, estado: 'activo' as 'activo' | 'inactivo' };
+    return {
+      id: null as number | null,
+      nombres: '', apellidos: '', cedula: '', correo: '', cargo: '',
+      tipo_responsable: 'funcionario',
+      area_id: null as number | null,
+      direccion_id: null as number | null,
+      estado: 'activo' as 'activo' | 'inactivo',
+      // acceso al sistema
+      dar_acceso: false,
+      usuario_nombre: '',
+      usuario_password: '',
+      usuario_rol: 'jefe_inmediato',
+      usuario_estado: 'activo' as 'activo' | 'inactivo'
+    };
   }
   private dirVacio() {
     return { id: null as number | null, nombre: '', estado: 'activo' as 'activo' | 'inactivo' };
