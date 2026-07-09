@@ -450,7 +450,7 @@ export class SolicitudDetalle implements OnInit {
       next: (blob: Blob) => {
         this.procesando = false;
         const blobUrl = URL.createObjectURL(new Blob([blob], { type: 'application/pdf' }));
-        this.abrirVisorPdf(blobUrl, `${this.solicitud?.codigo_solicitud || 'documento'}.pdf`);
+        window.open(blobUrl, '_blank');
       },
       error: (err: any) => {
         this.procesando = false;
@@ -1257,6 +1257,8 @@ export class SolicitudDetalle implements OnInit {
       return 'El certificado digital está expirado. Obtenga un certificado vigente.';
     if (m.includes('no válido') || m.includes('invalid') || m.includes('no es un'))
       return 'El archivo seleccionado no es un certificado digital válido (.p12/.pfx).';
+    if (m.includes('no tiene permisos') || m.includes('le corresponde al rol'))
+      return 'No tiene permisos para firmar en esta etapa del proceso. Esta firma le corresponde a otro rol.';
     if (m.includes('etapa') || m.includes('no puede firmar'))
       return 'No puede firmar en la etapa actual del proceso. Verifique que le corresponde este paso.';
     if (m.includes('ya existe') || m.includes('ya firmó'))

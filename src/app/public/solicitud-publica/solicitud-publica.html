@@ -271,16 +271,19 @@
           <p style="margin:4px 0 10px;font-size:13px;color:#64748b">
             Esta área tiene {{ jefesDisponibles.length }} jefes activos. Elija al que corresponde su solicitud.
           </p>
-          <select
-            class="form-select"
-            style="width:100%;padding:10px 12px;border-radius:8px;border:1.5px solid #cbd5e1;font-size:14px;background:#fff"
-            (change)="seleccionarJefe(+$any($event.target).value)"
-          >
-            <option value="0">-- Seleccione un jefe --</option>
-            <option *ngFor="let j of jefesDisponibles" [value]="j.id">
-              {{ j.nombres }} {{ j.apellidos || '' }} — {{ j.cargo }}
-            </option>
-          </select>
+          <div class="jefe-cards" style="display:flex;flex-direction:column;gap:8px;width:100%">
+            <button
+              type="button"
+              *ngFor="let j of jefesDisponibles"
+              class="jefe-card-option"
+              [class.selected]="jefeAsignado?.id === j.id"
+              (click)="seleccionarJefe(j.id)"
+              style="display:flex;flex-direction:column;align-items:flex-start;width:100%;padding:12px 14px;border-radius:8px;border:1.5px solid #cbd5e1;background:#fff;cursor:pointer;text-align:left"
+            >
+              <strong>{{ j.nombres }} {{ j.apellidos || '' }}</strong>
+              <span style="font-size:13px;color:#64748b">{{ j.cargo }}</span>
+            </button>
+          </div>
         </div>
         <div class="assigned-chief-card" *ngIf="jefeAsignado" style="margin-top:10px;width:100%;border:none;background:#f0fdf4;padding:10px 14px">
           <div>

@@ -268,7 +268,23 @@ export class Funcionarios implements OnInit {
     const primeraLetra = nombres.charAt(0).toLowerCase().replace(/[^a-z]/g, '');
     const primerApellido = apellidos.split(/\s+/)[0].toLowerCase()
       .normalize('NFD').replace(/[̀-ͯ]/g, '').replace(/[^a-z]/g, '');
-    this.formFunc.usuario_nombre = primeraLetra + primerApellido;
+    const base = primeraLetra + primerApellido;
+
+    let candidato = base;
+    let contador = 2;
+    while (this.usuarioSistemaEnUso(candidato)) {
+      candidato = `${base}${contador}`;
+      contador++;
+    }
+    this.formFunc.usuario_nombre = candidato;
+  }
+
+  private usuarioSistemaEnUso(usuario: string): boolean {
+    const idActual = this.formFunc.id;
+    return this.funcionarios.some(f =>
+      f.usuario_sistema?.toLowerCase() === usuario.toLowerCase() &&
+      !(idActual != null && f.id === idActual)
+    );
   }
 
   guardarFunc(): void {

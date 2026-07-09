@@ -17,7 +17,7 @@
         <a routerLink="/admin/dashboard" routerLinkActive="active"
            [routerLinkActiveOptions]="{ exact: true }">Dashboard</a>
         <a routerLink="/admin/solicitudes" routerLinkActive="active">Solicitudes</a>
-        <a routerLink="/admin/funcionarios" routerLinkActive="active">Funcionarios</a>
+        <a routerLink="/admin/funcionarios" routerLinkActive="active">Usuarios y Funcionarios</a>
         <a routerLink="/admin/reportes" routerLinkActive="active">Reportes</a>
         <a routerLink="/admin/auditoria" routerLinkActive="active">Auditoría</a>
       </ng-container>
@@ -273,12 +273,12 @@
 
         <div class="document-warning" *ngIf="solicitud.estado === 'pendiente_maxima_autoridad' && !autoridadHaSubidoDocumento">
           <i class="bi bi-exclamation-triangle-fill"></i>
-          Suba el PDF firmado antes de aprobar.
+          Debe firmar el PDF con su certificado digital antes de aprobar.
         </div>
 
         <div class="document-warning" *ngIf="solicitud.estado === 'pendiente_tics' && !ticsHaSubidoDocumento">
           <i class="bi bi-exclamation-triangle-fill"></i>
-          Suba el PDF firmado antes de aprobar la validación.
+          Debe firmar el PDF con su certificado digital antes de aprobar la validación.
         </div>
 
         <div class="document-success" *ngIf="solicitud.estado === 'pendiente_jefe_inmediato' && jefeHaSubidoDocumento">
@@ -551,7 +551,7 @@
               <div>
                 <span class="fd-eyebrow">Firma electrónica institucional</span>
                 <h3 id="modal-firma-digital-titulo">Firmar documento</h3>
-                <p>{{ solicitud?.codigo_solicitud }} · {{ solicitud?.nombres_completos }}</p>
+                <p>{{ solicitud.codigo_solicitud }} · {{ solicitud.nombres_completos }}</p>
               </div>
             </div>
             <button
@@ -649,11 +649,11 @@
                 </div>
                 <div class="fd-info-item">
                   <span>Etapa</span>
-                  <strong>{{ getEtapaTexto(solicitud?.etapa_actual || '') }}</strong>
+                  <strong>{{ getEtapaTexto(solicitud.etapa_actual || '') }}</strong>
                 </div>
                 <div class="fd-info-item">
                   <span>Solicitud</span>
-                  <strong>{{ solicitud?.codigo_solicitud }}</strong>
+                  <strong>{{ solicitud.codigo_solicitud }}</strong>
                 </div>
               </div>
 
@@ -830,7 +830,7 @@
 
             <div>
               <h3 id="modal-rechazo-titulo">¿Rechazar solicitud?</h3>
-              <p>{{ solicitud?.codigo_solicitud }}</p>
+              <p>{{ solicitud.codigo_solicitud }}</p>
             </div>
           </div>
 

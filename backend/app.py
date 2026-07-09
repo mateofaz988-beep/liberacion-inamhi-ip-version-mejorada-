@@ -4370,24 +4370,36 @@ def obtener_solicitud_admin(solicitud_id):
 def obtener_siguiente_estado_por_rol(estado_actual, rol_actual=None):
     reglas = {
         "pendiente_jefe_inmediato": {
+            "rol": "jefe_inmediato",
             "nuevo_estado": "pendiente_maxima_autoridad",
             "nueva_etapa": "maxima_autoridad"
         },
         "pendiente_maxima_autoridad": {
+            "rol": "maxima_autoridad",
             "nuevo_estado": "pendiente_tics",
             "nueva_etapa": "tics"
         },
         "pendiente_tics": {
+            "rol": "analista_tics",
             "nuevo_estado": "pendiente_ejecucion_tics",
             "nueva_etapa": "ejecucion_tics"
         },
         "pendiente_ejecucion_tics": {
+            "rol": "analista_tics",
             "nuevo_estado": "finalizada",
             "nueva_etapa": "finalizado"
         }
     }
 
-    return reglas.get(estado_actual)
+    regla = reglas.get(estado_actual)
+    if regla is None:
+        return None
+
+    # el rol autenticado debe coincidir con el rol dueño de esta etapa del flujo
+    if rol_actual is not None and regla["rol"] != rol_actual:
+        return None
+
+    return regla
 
 
 def obtener_estado_rechazo_por_rol(estado_actual, rol_actual=None):
@@ -5150,33 +5162,73 @@ def aprobar_solicitud(solicitud_id):
 
         # =====================================================
         # Validar documento firmado obligatorio
+        # Debe pertenecer a LA ETAPA ACTUAL — de lo contrario un documento
+        # firmado en una etapa anterior (ej. por el solicitante) permitiría
+        # aprobar sin que el rol correspondiente (jefe/autoridad/tics)
+        # haya firmado realmente. La etapa 'ejecucion_tics' es la excepción:
+        # es el segundo clic de TICS (finalizar) y reutiliza el documento
+        # firmado en la etapa 'tics' del primer clic.
         # =====================================================
 
-        cursor.execute("""
-            select
-                id,
-                tipo_documento,
-                nombre_archivo,
-                ruta_archivo,
-                mime_type,
-                firmado,
-                firma_validada
-            from solicitud_documentos
-            where solicitud_id = %s
-              and mime_type = 'application/pdf'
-              and (
-                    firmado = 1
-                    or firma_validada = 1
-                    or tipo_documento in (
-                        'pdf_firmado_manual',
-                        'pdf_firmado_electronico',
-                        'pdf_tics',
-                        'pdf_final'
-                    )
-              )
-            order by id desc
-            limit 1;
-        """, (solicitud_id,))
+        etapa_documento_requerida = {
+            "jefe_inmediato": "jefe_inmediato",
+            "maxima_autoridad": "maxima_autoridad",
+            "tics": "tics",
+        }.get(etapa_anterior)
+
+        if etapa_documento_requerida:
+            cursor.execute("""
+                select
+                    id,
+                    tipo_documento,
+                    nombre_archivo,
+                    ruta_archivo,
+                    mime_type,
+                    firmado,
+                    firma_validada
+                from solicitud_documentos
+                where solicitud_id = %s
+                  and etapa = %s
+                  and mime_type = 'application/pdf'
+                  and (
+                        firmado = 1
+                        or firma_validada = 1
+                        or tipo_documento in (
+                            'pdf_firmado_manual',
+                            'pdf_firmado_electronico',
+                            'pdf_tics',
+                            'pdf_final'
+                        )
+                  )
+                order by id desc
+                limit 1;
+            """, (solicitud_id, etapa_documento_requerida))
+        else:
+            cursor.execute("""
+                select
+                    id,
+                    tipo_documento,
+                    nombre_archivo,
+                    ruta_archivo,
+                    mime_type,
+                    firmado,
+                    firma_validada
+                from solicitud_documentos
+                where solicitud_id = %s
+                  and mime_type = 'application/pdf'
+                  and (
+                        firmado = 1
+                        or firma_validada = 1
+                        or tipo_documento in (
+                            'pdf_firmado_manual',
+                            'pdf_firmado_electronico',
+                            'pdf_tics',
+                            'pdf_final'
+                        )
+                  )
+                order by id desc
+                limit 1;
+            """, (solicitud_id,))
 
         documento_firmado = cursor.fetchone()
 
@@ -5657,16 +5709,19 @@ def rechazar_solicitud(solicitud_id):
 
         reglas_rechazo = {
             "pendiente_jefe_inmediato": {
+                "rol": "jefe_inmediato",
                 "nuevo_estado": "rechazada_jefe_inmediato",
                 "nueva_etapa": "jefe_inmediato",
                 "mensaje": "solicitud rechazada por el jefe inmediato."
             },
             "pendiente_maxima_autoridad": {
+                "rol": "maxima_autoridad",
                 "nuevo_estado": "rechazada_maxima_autoridad",
                 "nueva_etapa": "maxima_autoridad",
                 "mensaje": "solicitud rechazada por la máxima autoridad."
             },
             "pendiente_tics": {
+                "rol": "analista_tics",
                 "nuevo_estado": "rechazada_tics",
                 "nueva_etapa": "tics",
                 "mensaje": "solicitud rechazada por TICS."
@@ -5684,6 +5739,17 @@ def rechazar_solicitud(solicitud_id):
                 "mensaje": "la solicitud no está en un estado que permita rechazo.",
                 "estado_actual": estado_anterior
             }), 409
+
+        if regla["rol"] != rol_actual:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "no tiene permisos para rechazar esta solicitud en su estado actual.",
+                "rol_actual": rol_actual,
+                "estado_actual": estado_anterior
+            }), 403
 
         # =====================================================
         # Actualizar solicitud
@@ -6398,6 +6464,62 @@ def catalogo_cargos():
 # FUNCIONARIOS — CRUD sobre area_personal
 # =====================================================
 
+def _resolver_rol_usuario(cursor, rol_nombre):
+    """Busca el id de un rol activo por nombre. Reutilizado por crear/actualizar cuentas de usuarios."""
+    cursor.execute("""
+        select id
+        from roles
+        where nombre = %s
+          and estado = 'activo'
+        limit 1;
+    """, (rol_nombre,))
+    return cursor.fetchone()
+
+
+def _crear_registro_usuario(cursor, *, rol_id, nombres, apellidos, cedula, correo, usuario,
+                             password_plano, cargo, area_unidad, dependencia, telefono_ext, estado):
+    """Inserta una fila en `usuarios` con el password ya hasheado (bcrypt). Devuelve el id creado."""
+    password_hash = crear_hash_password(password_plano)
+    cursor.execute("""
+        insert into usuarios (
+            rol_id, nombres, apellidos, cedula, correo, usuario, password_hash,
+            cargo, area_unidad, dependencia, telefono_ext, estado
+        ) values (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s);
+    """, (
+        rol_id, nombres, apellidos, cedula, correo, usuario, password_hash,
+        cargo, area_unidad, dependencia, telefono_ext, estado
+    ))
+    return cursor.lastrowid
+
+
+def _actualizar_registro_usuario(cursor, usuario_id, *, rol_id, nombres, apellidos, cedula, correo,
+                                  usuario, password_plano, cargo, area_unidad, dependencia,
+                                  telefono_ext, estado):
+    """Actualiza una fila de `usuarios`. Si password_plano viene vacío, no cambia la contraseña."""
+    if password_plano:
+        password_hash = crear_hash_password(password_plano)
+        cursor.execute("""
+            update usuarios
+            set rol_id=%s, nombres=%s, apellidos=%s, cedula=%s, correo=%s, usuario=%s,
+                password_hash=%s, cargo=%s, area_unidad=%s, dependencia=%s,
+                telefono_ext=%s, estado=%s
+            where id=%s;
+        """, (
+            rol_id, nombres, apellidos, cedula, correo, usuario, password_hash,
+            cargo, area_unidad, dependencia, telefono_ext, estado, usuario_id
+        ))
+    else:
+        cursor.execute("""
+            update usuarios
+            set rol_id=%s, nombres=%s, apellidos=%s, cedula=%s, correo=%s, usuario=%s,
+                cargo=%s, area_unidad=%s, dependencia=%s, telefono_ext=%s, estado=%s
+            where id=%s;
+        """, (
+            rol_id, nombres, apellidos, cedula, correo, usuario,
+            cargo, area_unidad, dependencia, telefono_ext, estado, usuario_id
+        ))
+
+
 @app.route("/api/admin/funcionarios", methods=["GET"])
 @token_requerido
 @roles_permitidos("administrador")
@@ -6427,7 +6549,7 @@ def listar_funcionarios():
                 d.nombre  AS direccion_nombre,
                 ap.usuario_id,
                 u.usuario AS usuario_sistema,
-                u.rol     AS usuario_rol,
+                r.nombre  AS usuario_rol,
                 u.estado  AS usuario_estado,
                 ap.created_at,
                 ap.updated_at
@@ -6435,6 +6557,7 @@ def listar_funcionarios():
             LEFT JOIN areas       a ON a.id  = ap.area_id
             LEFT JOIN direcciones d ON d.id  = a.direccion_id
             LEFT JOIN usuarios    u ON u.id  = ap.usuario_id
+            LEFT JOIN roles       r ON r.id  = u.rol_id
             WHERE 1=1
         """
         params = []
@@ -6503,6 +6626,10 @@ def crear_funcionario():
         roles_validos = ("administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics")
         if usuario_rol not in roles_validos:
             return jsonify({"estado": "error", "mensaje": "Rol de usuario no válido."}), 400
+        if not re.match(r"^\d{10}$", cedula or ""):
+            return jsonify({"estado": "error", "mensaje": "Para dar acceso al sistema, la cédula debe tener exactamente 10 números."}), 400
+        if not re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", correo or ""):
+            return jsonify({"estado": "error", "mensaje": "Para dar acceso al sistema, ingrese un correo válido."}), 400
         if usuario_estado not in ("activo", "inactivo"):
             usuario_estado = "activo"
 
@@ -6519,28 +6646,44 @@ def crear_funcionario():
 
         nuevo_usuario_id = None
         if dar_acceso:
-            # verificar que el nombre de usuario no exista
-            cursor.execute("SELECT id FROM usuarios WHERE usuario=%s LIMIT 1", (usuario_nombre,))
+            rol_encontrado = _resolver_rol_usuario(cursor, usuario_rol)
+            if rol_encontrado is None:
+                cursor.close()
+                conexion.close()
+                return jsonify({"estado": "error", "mensaje": "el rol seleccionado no existe o está inactivo."}), 400
+
+            # verificar que la cédula, el correo o el nombre de usuario no estén en uso
+            cursor.execute(
+                "SELECT id FROM usuarios WHERE cedula=%s OR correo=%s OR usuario=%s LIMIT 1",
+                (cedula, correo, usuario_nombre)
+            )
             if cursor.fetchone():
                 cursor.close()
                 conexion.close()
-                return jsonify({"estado": "error", "mensaje": f"El nombre de usuario '{usuario_nombre}' ya está en uso."}), 400
+                return jsonify({"estado": "error", "mensaje": "ya existe un usuario con la misma cédula, correo o nombre de usuario."}), 409
 
-            from werkzeug.security import generate_password_hash
-            hash_pass = generate_password_hash(usuario_pass)
-            nombres_arr = (nombres or "").split()
-            apellidos_arr = (apellidos or "").split()
+            # el cargo/área/dependencia de la cuenta se resuelven desde la estructura elegida
             cursor.execute("""
-                INSERT INTO usuarios
-                    (nombres, apellidos, cedula, correo, usuario, password, rol, estado, created_at, updated_at)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
-            """, (
-                nombres, apellidos,
-                cedula or None, correo or None,
-                usuario_nombre, hash_pass,
-                usuario_rol, usuario_estado
-            ))
-            nuevo_usuario_id = cursor.lastrowid
+                SELECT a.nombre AS area_nombre, d.nombre AS direccion_nombre
+                FROM areas a
+                LEFT JOIN direcciones d ON d.id = a.direccion_id
+                WHERE a.id = %s
+                LIMIT 1;
+            """, (area_id,))
+            estructura = cursor.fetchone() or {}
+
+            nuevo_usuario_id = _crear_registro_usuario(
+                cursor,
+                rol_id=rol_encontrado["id"],
+                nombres=nombres, apellidos=apellidos,
+                cedula=cedula, correo=correo, usuario=usuario_nombre,
+                password_plano=usuario_pass,
+                cargo=cargo,
+                area_unidad=estructura.get("area_nombre") or "",
+                dependencia=estructura.get("direccion_nombre") or "",
+                telefono_ext=None,
+                estado=usuario_estado
+            )
 
         cursor.execute("""
             INSERT INTO area_personal
@@ -6582,6 +6725,17 @@ def actualizar_funcionario(funcionario_id):
     if not nombres or not apellidos or not cargo or not area_id:
         return jsonify({"estado": "error", "mensaje": "nombres, apellidos, cargo y área son obligatorios"}), 400
 
+    if dar_acceso:
+        roles_validos = ("administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics")
+        if usuario_rol not in roles_validos:
+            return jsonify({"estado": "error", "mensaje": "Rol de usuario no válido."}), 400
+        if not re.match(r"^\d{10}$", cedula or ""):
+            return jsonify({"estado": "error", "mensaje": "Para dar acceso al sistema, la cédula debe tener exactamente 10 números."}), 400
+        if not re.match(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$", correo or ""):
+            return jsonify({"estado": "error", "mensaje": "Para dar acceso al sistema, ingrese un correo válido."}), 400
+        if usuario_estado not in ("activo", "inactivo"):
+            usuario_estado = "activo"
+
     if estado not in ("activo", "inactivo"):
         estado = "activo"
     if tipo not in ("jefe_area", "analista_tics", "funcionario", "responsable_tecnico"):
@@ -6605,12 +6759,22 @@ def actualizar_funcionario(funcionario_id):
         nuevo_usuario_id  = usuario_id_actual  # por defecto, conserva el vínculo
 
         if dar_acceso:
-            roles_validos = ("administrador", "jefe_inmediato", "maxima_autoridad", "analista_tics")
-            if usuario_rol not in roles_validos:
+            rol_encontrado = _resolver_rol_usuario(cursor, usuario_rol)
+            if rol_encontrado is None:
                 cursor.close(); conexion.close()
-                return jsonify({"estado": "error", "mensaje": "Rol de usuario no válido."}), 400
-            if usuario_estado not in ("activo", "inactivo"):
-                usuario_estado = "activo"
+                return jsonify({"estado": "error", "mensaje": "el rol seleccionado no existe o está inactivo."}), 400
+
+            # el cargo/área/dependencia de la cuenta se resuelven desde la estructura elegida
+            cursor.execute("""
+                SELECT a.nombre AS area_nombre, d.nombre AS direccion_nombre
+                FROM areas a
+                LEFT JOIN direcciones d ON d.id = a.direccion_id
+                WHERE a.id = %s
+                LIMIT 1;
+            """, (area_id,))
+            estructura = cursor.fetchone() or {}
+            area_unidad_cuenta = estructura.get("area_nombre") or ""
+            dependencia_cuenta = estructura.get("direccion_nombre") or ""
 
             if usuario_id_actual:
                 # actualizar usuario existente
@@ -6619,39 +6783,57 @@ def actualizar_funcionario(funcionario_id):
                     if cursor.fetchone():
                         cursor.close(); conexion.close()
                         return jsonify({"estado": "error", "mensaje": f"El nombre de usuario '{usuario_nombre}' ya está en uso."}), 400
-                    cursor.execute(
-                        "UPDATE usuarios SET usuario=%s, rol=%s, estado=%s, updated_at=NOW() WHERE id=%s",
-                        (usuario_nombre, usuario_rol, usuario_estado, usuario_id_actual)
-                    )
+                    nombre_cuenta = usuario_nombre
                 else:
-                    cursor.execute(
-                        "UPDATE usuarios SET rol=%s, estado=%s, updated_at=NOW() WHERE id=%s",
-                        (usuario_rol, usuario_estado, usuario_id_actual)
-                    )
-                if usuario_pass:
-                    from werkzeug.security import generate_password_hash
-                    cursor.execute(
-                        "UPDATE usuarios SET password=%s, updated_at=NOW() WHERE id=%s",
-                        (generate_password_hash(usuario_pass), usuario_id_actual)
-                    )
+                    cursor.execute("SELECT usuario FROM usuarios WHERE id=%s LIMIT 1", (usuario_id_actual,))
+                    fila_cuenta = cursor.fetchone()
+                    nombre_cuenta = fila_cuenta["usuario"] if fila_cuenta else usuario_nombre
+
+                cursor.execute(
+                    "SELECT id FROM usuarios WHERE (cedula=%s OR correo=%s) AND id!=%s LIMIT 1",
+                    (cedula, correo, usuario_id_actual)
+                )
+                if cursor.fetchone():
+                    cursor.close(); conexion.close()
+                    return jsonify({"estado": "error", "mensaje": "ya existe otro usuario con la misma cédula o correo."}), 409
+
+                _actualizar_registro_usuario(
+                    cursor, usuario_id_actual,
+                    rol_id=rol_encontrado["id"],
+                    nombres=nombres, apellidos=apellidos,
+                    cedula=cedula, correo=correo, usuario=nombre_cuenta,
+                    password_plano=usuario_pass,
+                    cargo=cargo,
+                    area_unidad=area_unidad_cuenta,
+                    dependencia=dependencia_cuenta,
+                    telefono_ext=None,
+                    estado=usuario_estado
+                )
             else:
                 # crear nuevo usuario y vincular
                 if not usuario_nombre or not usuario_pass:
                     cursor.close(); conexion.close()
                     return jsonify({"estado": "error", "mensaje": "Para dar acceso nuevo, nombre de usuario y contraseña son obligatorios."}), 400
-                cursor.execute("SELECT id FROM usuarios WHERE usuario=%s LIMIT 1", (usuario_nombre,))
+                cursor.execute(
+                    "SELECT id FROM usuarios WHERE cedula=%s OR correo=%s OR usuario=%s LIMIT 1",
+                    (cedula, correo, usuario_nombre)
+                )
                 if cursor.fetchone():
                     cursor.close(); conexion.close()
-                    return jsonify({"estado": "error", "mensaje": f"El nombre de usuario '{usuario_nombre}' ya está en uso."}), 400
-                from werkzeug.security import generate_password_hash
-                cursor.execute("""
-                    INSERT INTO usuarios
-                        (nombres, apellidos, cedula, correo, usuario, password, rol, estado, created_at, updated_at)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW(),NOW())
-                """, (nombres, apellidos, cedula or None, correo or None,
-                      usuario_nombre, generate_password_hash(usuario_pass),
-                      usuario_rol, usuario_estado))
-                nuevo_usuario_id = cursor.lastrowid
+                    return jsonify({"estado": "error", "mensaje": "ya existe un usuario con la misma cédula, correo o nombre de usuario."}), 409
+
+                nuevo_usuario_id = _crear_registro_usuario(
+                    cursor,
+                    rol_id=rol_encontrado["id"],
+                    nombres=nombres, apellidos=apellidos,
+                    cedula=cedula, correo=correo, usuario=usuario_nombre,
+                    password_plano=usuario_pass,
+                    cargo=cargo,
+                    area_unidad=area_unidad_cuenta,
+                    dependencia=dependencia_cuenta,
+                    telefono_ext=None,
+                    estado=usuario_estado
+                )
 
         else:
             # dar_acceso = False: si el funcionario tenía cuenta vinculada,
@@ -6994,44 +7176,21 @@ def crear_usuario_admin():
                 "mensaje": "ya existe un usuario con la misma cédula, correo o nombre de usuario."
             }), 409
 
-        password_hash = bcrypt.hashpw(
-            password.encode("utf-8"),
-            bcrypt.gensalt()
-        ).decode("utf-8")
-
-        cursor.execute("""
-            insert into usuarios (
-                rol_id,
-                nombres,
-                apellidos,
-                cedula,
-                correo,
-                usuario,
-                password_hash,
-                cargo,
-                area_unidad,
-                dependencia,
-                telefono_ext,
-                estado
-            ) values (
-                %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s
-            );
-        """, (
-            rol_encontrado["id"],
-            nombres,
-            apellidos,
-            cedula,
-            correo,
-            usuario,
-            password_hash,
-            cargo,
-            area_unidad,
-            dependencia,
-            telefono_ext,
-            estado
-        ))
-
-        usuario_id = cursor.lastrowid
+        usuario_id = _crear_registro_usuario(
+            cursor,
+            rol_id=rol_encontrado["id"],
+            nombres=nombres,
+            apellidos=apellidos,
+            cedula=cedula,
+            correo=correo,
+            usuario=usuario,
+            password_plano=password,
+            cargo=cargo,
+            area_unidad=area_unidad,
+            dependencia=dependencia,
+            telefono_ext=telefono_ext,
+            estado=estado
+        )
 
         cursor.execute("""
             insert into auditoria (
@@ -7264,73 +7423,21 @@ def actualizar_usuario_admin(usuario_id):
                 "mensaje": "ya existe otro usuario con la misma cédula, correo o nombre de usuario."
             }), 409
 
-        if password:
-            password_hash = bcrypt.hashpw(
-                password.encode("utf-8"),
-                bcrypt.gensalt()
-            ).decode("utf-8")
-
-            cursor.execute("""
-                update usuarios
-                set
-                    rol_id = %s,
-                    nombres = %s,
-                    apellidos = %s,
-                    cedula = %s,
-                    correo = %s,
-                    usuario = %s,
-                    password_hash = %s,
-                    cargo = %s,
-                    area_unidad = %s,
-                    dependencia = %s,
-                    telefono_ext = %s,
-                    estado = %s
-                where id = %s;
-            """, (
-                rol_encontrado["id"],
-                nombres,
-                apellidos,
-                cedula,
-                correo,
-                usuario,
-                password_hash,
-                cargo,
-                area_unidad,
-                dependencia,
-                telefono_ext,
-                estado,
-                usuario_id
-            ))
-        else:
-            cursor.execute("""
-                update usuarios
-                set
-                    rol_id = %s,
-                    nombres = %s,
-                    apellidos = %s,
-                    cedula = %s,
-                    correo = %s,
-                    usuario = %s,
-                    cargo = %s,
-                    area_unidad = %s,
-                    dependencia = %s,
-                    telefono_ext = %s,
-                    estado = %s
-                where id = %s;
-            """, (
-                rol_encontrado["id"],
-                nombres,
-                apellidos,
-                cedula,
-                correo,
-                usuario,
-                cargo,
-                area_unidad,
-                dependencia,
-                telefono_ext,
-                estado,
-                usuario_id
-            ))
+        _actualizar_registro_usuario(
+            cursor, usuario_id,
+            rol_id=rol_encontrado["id"],
+            nombres=nombres,
+            apellidos=apellidos,
+            cedula=cedula,
+            correo=correo,
+            usuario=usuario,
+            password_plano=password,
+            cargo=cargo,
+            area_unidad=area_unidad,
+            dependencia=dependencia,
+            telefono_ext=telefono_ext,
+            estado=estado
+        )
 
         datos_nuevos = {
             "id": usuario_id,
@@ -7756,7 +7863,8 @@ def obtener_jefe_por_area_publica(area_id):
             "mensaje": "jefes del área obtenidos correctamente.",
             "area_id": area_id,
             "jefes": jefes,
-            "jefe": jefes[0]
+            "jefe": jefes[0],
+            "total": len(jefes)
         }), 200
 
     except Error as error:
@@ -9155,7 +9263,7 @@ def _inicializar_tablas_firma():
         id INT AUTO_INCREMENT PRIMARY KEY,
         solicitud_id INT NOT NULL,
         documento_id INT NULL,
-        usuario_id INT NOT NULL,
+        usuario_id INT NULL,
         rol_firmante VARCHAR(50) NOT NULL,
         etapa VARCHAR(50) NOT NULL,
         modo_firma ENUM('pyhanko','firmaec') NOT NULL DEFAULT 'pyhanko',
@@ -9233,6 +9341,16 @@ def _inicializar_tablas_firma():
             if stmt:
                 cursor.execute(stmt)
         conexion.commit()
+
+        # La solicitante firma sin usuario_id (no tiene cuenta en el sistema).
+        # Si la tabla ya existía de una versión anterior con usuario_id NOT NULL,
+        # esa firma fallaba y la solicitud nunca avanzaba a jefe inmediato.
+        try:
+            cursor.execute("ALTER TABLE firmas_digitales MODIFY usuario_id INT NULL")
+            conexion.commit()
+        except Exception as e_alter:
+            log.debug(f"firmas_digitales.usuario_id ya es NULL o no se pudo alterar: {e_alter}")
+
         cursor.close()
         conexion.close()
     except Exception as e:
@@ -9381,6 +9499,15 @@ def firmar_pdf_con_pyhanko(solicitud_id):
                 "estado": "error",
                 "mensaje": f"No se puede firmar en la etapa actual ({solicitud['etapa_actual']})."
             }), 409
+
+        if rol_actual != rol_firmante:
+            cursor.close(); conexion.close()
+            return jsonify({
+                "estado": "error",
+                "mensaje": f"No tiene permisos para firmar en esta etapa. Le corresponde al rol: {rol_firmante}.",
+                "rol_actual": rol_actual,
+                "rol_requerido": rol_firmante
+            }), 403
 
         # Verificar que esta etapa no haya sido firmada ya
         cursor.execute("""

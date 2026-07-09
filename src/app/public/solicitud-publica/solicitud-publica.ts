@@ -525,7 +525,10 @@ export class SolicitudPublica implements OnInit {
     });
   }
 
-  seleccionarJefe(jefeId: number): void {
+  seleccionarJefe(jefeId: number | undefined): void {
+    if (jefeId === undefined) {
+      return;
+    }
     this.jefeAsignado = this.jefesDisponibles.find(j => j.id === jefeId) || null;
   }
 

@@ -524,6 +524,19 @@ small {
   }
 }
 
+.jefe-card-option {
+  transition: border-color 0.15s ease, background 0.15s ease;
+
+  &:hover {
+    border-color: #93c5fd;
+  }
+
+  &.selected {
+    border-color: #16a34a !important;
+    background: #f0fdf4 !important;
+  }
+}
+
 .assigned-chief-card.warning {
   background:
     radial-gradient(circle at top right, rgba(245, 158, 11, 0.16), transparent 35%),
