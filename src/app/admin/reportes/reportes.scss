@@ -238,36 +238,6 @@
 }
 
 /* =====================================================
-   PRINT HEADER
-===================================================== */
-
-.only-print {
-  display: none;
-}
-
-.print-header {
-  margin-bottom: 22px;
-  text-align: center;
-
-  h1 {
-    margin: 0;
-    font-size: 24px;
-    font-weight: 950;
-    color: #0f172a;
-  }
-
-  p {
-    margin: 6px 0;
-    color: #334155;
-  }
-
-  span {
-    color: #64748b;
-    font-size: 13px;
-  }
-}
-
-/* =====================================================
    STATS
 ===================================================== */
 
@@ -458,9 +428,7 @@
   gap: 12px;
 }
 
-.clear-btn,
-.csv-btn,
-.print-btn {
+.clear-btn {
   border: none;
   cursor: pointer;
   padding: 13px 16px;
@@ -482,18 +450,6 @@
   &:hover {
     background: #e2e8f0;
   }
-}
-
-.csv-btn {
-  color: #ffffff;
-  background: linear-gradient(135deg, #15803d, #22c55e);
-  box-shadow: 0 14px 28px rgba(34, 197, 94, 0.18);
-}
-
-.print-btn {
-  color: #ffffff;
-  background: linear-gradient(135deg, #334155, #0f172a);
-  box-shadow: 0 14px 28px rgba(15, 23, 42, 0.18);
 }
 
 /* =====================================================
@@ -717,9 +673,7 @@ tbody td {
     flex-direction: column;
   }
 
-  .clear-btn,
-  .csv-btn,
-  .print-btn {
+  .clear-btn {
     width: 100%;
   }
 
@@ -734,93 +688,4 @@ tbody td {
     border-radius: 20px;
     padding: 18px;
   }
-}
-
-/* =====================================================
-   PRINT
-===================================================== */
-
-@media print {
-  .no-print {
-    display: none !important;
-  }
-
-  .only-print {
-    display: block !important;
-  }
-
-  .reportes-page {
-    display: block;
-    background: #ffffff;
-  }
-
-  .content {
-    padding: 0;
-    max-width: none;
-  }
-
-  .print-header {
-    margin-bottom: 16px;
-  }
-
-  .stats-grid {
-    grid-template-columns: repeat(3, 1fr);
-    gap: 10px;
-  }
-
-  .stat-card,
-  .table-card {
-    box-shadow: none;
-    border: 1px solid #cbd5e1;
-  }
-
-  .stat-card {
-    padding: 12px;
-
-    strong {
-      font-size: 24px;
-    }
-
-    p {
-      font-size: 11px;
-    }
-  }
-
-  .table-card {
-    padding: 12px;
-  }
-
-  table {
-    min-width: 0;
-    font-size: 11px;
-  }
-
-  thead th,
-  tbody td {
-    padding: 7px;
-  }
-
-  .status {
-    padding: 4px 6px;
-    font-size: 10px;
-  }
-
-  .logo-box {
-  width: 54px;
-  height: 54px;
-  min-width: 54px;
-  border-radius: 18px;
-  display: grid;
-  place-items: center;
-
-  background: linear-gradient(135deg, #06b6d4, #0284c7);
-  color: #ffffff;
-
-  box-shadow: 0 16px 34px rgba(14, 165, 233, 0.36);
-}
-
-.logo-box i {
-  font-size: 26px;
-  line-height: 1;
-}
 }

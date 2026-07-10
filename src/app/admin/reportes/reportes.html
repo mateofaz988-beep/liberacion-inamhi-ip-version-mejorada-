@@ -1,5 +1,5 @@
 <section class="reportes-page">
-  <aside class="sidebar no-print">
+  <aside class="sidebar">
     <div class="brand">
       
       <div class="logo-box">
@@ -40,12 +40,12 @@
   </aside>
 
   <main class="content">
-    <header class="topbar no-print">
+    <header class="topbar">
       <div>
         <span class="eyebrow">Reportería institucional</span>
         <h1>Reportes de Solicitudes</h1>
         <p>
-          Consulte, filtre, exporte e imprima reportes del flujo de liberación web.
+          Consulte y filtre reportes del flujo de liberación web.
         </p>
       </div>
 
@@ -58,12 +58,6 @@
         {{ cargando ? 'Cargando...' : 'Actualizar' }}
       </button>
     </header>
-
-    <section class="print-header only-print">
-      <h1>Reporte de Solicitudes de Liberación Web</h1>
-      <p>Sistema de Gestión de Solicitudes de Liberación Web - INAMHI</p>
-      <span>Fecha de impresión: {{ fechaDesde || 'Todas' }} - {{ fechaHasta || 'Todas' }}</span>
-    </section>
 
     <section class="stats-grid">
       <article class="stat-card total">
@@ -103,7 +97,7 @@
       </article>
     </section>
 
-    <section class="filters-card no-print">
+    <section class="filters-card">
       <div>
         <h2>Filtros del reporte</h2>
         <p>
@@ -160,10 +154,6 @@
         <button type="button" class="clear-btn" (click)="limpiarFiltros()">
           Limpiar filtros
         </button>
-
-        
-
-        
       </div>
     </section>
 
@@ -206,7 +196,7 @@
               <th>Estado</th>
               <th>Etapa</th>
               <th>Fecha</th>
-              <th class="no-print">Acciones</th>
+              <th>Acciones</th>
             </tr>
           </thead>
 
@@ -247,7 +237,7 @@
                 {{ solicitud.fecha_solicitud }}
               </td>
 
-              <td class="actions-cell no-print">
+              <td class="actions-cell">
                 <button
                   type="button"
                   class="detail-btn"

@@ -101,7 +101,7 @@ export class SeguimientoSolicitud {
       return;
     }
 
-    this.error = 'Código inválido. Use un código manual como MAN-65CA1D9A o un código electrónico como INAMHI-WEB-2026-0001.';
+    this.error = 'Código inválido. Use un código manual como INAMHI-2026-001-AWM o un código electrónico como INAMHI-2026-001-AWE.';
   }
 
   private consultarManual(codigoManual: string): void {
@@ -159,11 +159,13 @@ export class SeguimientoSolicitud {
   }
 
   esCodigoManual(codigo: string): boolean {
-    return /^MAN-[A-Z0-9]{8}$/.test(codigo);
+    // INAMHI-2026-001-AWM (formato nuevo) o MAN-65CA1D9A (formato anterior, sigue vigente)
+    return /^(INAMHI-\d{4}-\d{3}-AWM|MAN-[A-Z0-9]{8})$/.test(codigo);
   }
 
   esCodigoElectronico(codigo: string): boolean {
-    return /^INAMHI-WEB-\d{4}-\d{4}$/.test(codigo);
+    // INAMHI-2026-001-AWE (formato nuevo) o INAMHI-WEB-2026-0001 (formato anterior, sigue vigente)
+    return /^(INAMHI-\d{4}-\d{3}-AWE|INAMHI-WEB-\d{4}-\d{4})$/.test(codigo);
   }
 
   seleccionarArchivoManual(event: Event): void {

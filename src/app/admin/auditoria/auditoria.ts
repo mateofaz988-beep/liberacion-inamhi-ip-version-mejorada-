@@ -69,30 +69,38 @@ export class Auditoria implements OnInit {
   totalDocumentos = 0;
   totalSistema = 0;
 
+  // Estos valores deben coincidir exactamente con los `modulo=`/`accion=` que
+  // registra el backend en registrar_auditoria() (backend/app.py). Antes esta
+  // lista tenía valores que el backend nunca genera (auth, usuarios, login,
+  // etc.), por lo que filtrar por ellos siempre daba "sin resultados" aunque
+  // sí hubiera registros — el filtro nunca podía coincidir con nada real.
   modulos = [
     { valor: '', texto: 'Todos los módulos' },
-    { valor: 'auth', texto: 'Autenticación' },
-    { valor: 'solicitudes', texto: 'Solicitudes' },
+    { valor: 'solicitud_publica', texto: 'Solicitud pública' },
+    { valor: 'firmaec_publico', texto: 'Firma electrónica (público)' },
+    { valor: 'firmaec_jefe', texto: 'Firma electrónica (jefe)' },
+    { valor: 'flujo_manual', texto: 'Flujo manual' },
     { valor: 'flujo_solicitud', texto: 'Flujo de solicitud' },
     { valor: 'documentos', texto: 'Documentos' },
-    { valor: 'usuarios', texto: 'Usuarios' },
-    { valor: 'reportes', texto: 'Reportes' },
-    { valor: 'sistema', texto: 'Sistema' }
+    { valor: 'firma_digital', texto: 'Firma digital (pyHanko)' },
+    { valor: 'correo', texto: 'Correo' }
   ];
 
   acciones = [
     { valor: '', texto: 'Todas las acciones' },
-    { valor: 'login', texto: 'Inicio de sesión' },
-    { valor: 'crear', texto: 'Crear' },
-    { valor: 'actualizar', texto: 'Actualizar' },
-    { valor: 'eliminar', texto: 'Eliminar' },
-    { valor: 'aprobar', texto: 'Aprobar' },
-    { valor: 'aprobar_solicitud', texto: 'Aprobar solicitud' },
-    { valor: 'rechazar', texto: 'Rechazar' },
-    { valor: 'rechazar_solicitud', texto: 'Rechazar solicitud' },
+    { valor: 'crear_solicitud', texto: 'Crear solicitud' },
+    { valor: 'preparar_solicitud_firmaec', texto: 'Preparar solicitud FirmaEC' },
+    { valor: 'subir_pdf_firmado_solicitante', texto: 'Subir PDF firmado (solicitante)' },
+    { valor: 'subir_pdf_firmado_jefe', texto: 'Subir PDF firmado (jefe)' },
+    { valor: 'registrar_descarga_manual', texto: 'Registrar descarga manual' },
+    { valor: 'subir_documento_manual_finalizado', texto: 'Subir documento manual finalizado' },
+    { valor: 'descargar_documento_manual_firmado', texto: 'Descargar documento manual firmado' },
+    { valor: 'generar_pdf_firmado_electronico', texto: 'Generar PDF firmado electrónico' },
     { valor: 'subir_documento_firmado', texto: 'Subir documento firmado' },
-    { valor: 'descargar_pdf', texto: 'Descargar PDF' },
-    { valor: 'cambiar_estado', texto: 'Cambiar estado' }
+    { valor: 'aprobar_solicitud', texto: 'Aprobar solicitud' },
+    { valor: 'firmar_pdf_pyhanko', texto: 'Firmar PDF (pyHanko)' },
+    { valor: 'enviar_correo_finalizacion', texto: 'Enviar correo de finalización' },
+    { valor: 'error_correo_finalizacion', texto: 'Error al enviar correo de finalización' }
   ];
 
   registroSeleccionado: AuditoriaRegistro | null = null;
@@ -220,8 +228,9 @@ export class Auditoria implements OnInit {
     this.totalRegistros = this.registrosFiltrados.length;
 
     this.totalSolicitudes = this.registrosFiltrados.filter((registro) =>
-      registro.modulo === 'solicitudes' ||
-      registro.modulo === 'flujo_solicitud'
+      registro.modulo === 'solicitud_publica' ||
+      registro.modulo === 'flujo_solicitud' ||
+      registro.modulo === 'flujo_manual'
     ).length;
 
     this.totalUsuarios = this.registrosFiltrados.filter((registro) =>
@@ -229,11 +238,14 @@ export class Auditoria implements OnInit {
     ).length;
 
     this.totalDocumentos = this.registrosFiltrados.filter((registro) =>
-      registro.modulo === 'documentos'
+      registro.modulo === 'documentos' ||
+      registro.modulo === 'firmaec_publico' ||
+      registro.modulo === 'firmaec_jefe' ||
+      registro.modulo === 'firma_digital'
     ).length;
 
     this.totalSistema = this.registrosFiltrados.filter((registro) =>
-      registro.modulo === 'sistema' || registro.modulo === 'auth'
+      registro.modulo === 'correo'
     ).length;
   }
 
@@ -346,13 +358,14 @@ export class Auditoria implements OnInit {
 
   getModuloTexto(modulo: string): string {
     const modulos: Record<string, string> = {
-      auth: 'Autenticación',
-      solicitudes: 'Solicitudes',
+      solicitud_publica: 'Solicitud pública',
+      firmaec_publico: 'Firma electrónica (público)',
+      firmaec_jefe: 'Firma electrónica (jefe)',
+      flujo_manual: 'Flujo manual',
       flujo_solicitud: 'Flujo de solicitud',
       documentos: 'Documentos',
-      usuarios: 'Usuarios',
-      reportes: 'Reportes',
-      sistema: 'Sistema'
+      firma_digital: 'Firma digital (pyHanko)',
+      correo: 'Correo'
     };
 
     return modulos[modulo] || this.formatearTexto(modulo);
@@ -360,17 +373,19 @@ export class Auditoria implements OnInit {
 
   getAccionTexto(accion: string): string {
     const acciones: Record<string, string> = {
-      login: 'Inicio de sesión',
-      crear: 'Crear',
-      actualizar: 'Actualizar',
-      eliminar: 'Eliminar',
-      aprobar: 'Aprobar',
-      aprobar_solicitud: 'Aprobar solicitud',
-      rechazar: 'Rechazar',
-      rechazar_solicitud: 'Rechazar solicitud',
+      crear_solicitud: 'Crear solicitud',
+      preparar_solicitud_firmaec: 'Preparar solicitud FirmaEC',
+      subir_pdf_firmado_solicitante: 'Subir PDF firmado (solicitante)',
+      subir_pdf_firmado_jefe: 'Subir PDF firmado (jefe)',
+      registrar_descarga_manual: 'Registrar descarga manual',
+      subir_documento_manual_finalizado: 'Subir documento manual finalizado',
+      descargar_documento_manual_firmado: 'Descargar documento manual firmado',
+      generar_pdf_firmado_electronico: 'Generar PDF firmado electrónico',
       subir_documento_firmado: 'Subir documento firmado',
-      descargar_pdf: 'Descargar PDF',
-      cambiar_estado: 'Cambiar estado'
+      aprobar_solicitud: 'Aprobar solicitud',
+      firmar_pdf_pyhanko: 'Firmar PDF (pyHanko)',
+      enviar_correo_finalizacion: 'Enviar correo de finalización',
+      error_correo_finalizacion: 'Error al enviar correo de finalización'
     };
 
     return acciones[accion] || this.formatearTexto(accion);
@@ -378,13 +393,14 @@ export class Auditoria implements OnInit {
 
   getModuloClase(modulo: string): string {
     const clases: Record<string, string> = {
-      auth: 'auth',
-      solicitudes: 'solicitudes',
+      solicitud_publica: 'solicitudes',
+      firmaec_publico: 'documentos',
+      firmaec_jefe: 'documentos',
+      flujo_manual: 'solicitudes',
       flujo_solicitud: 'solicitudes',
       documentos: 'documentos',
-      usuarios: 'usuarios',
-      reportes: 'reportes',
-      sistema: 'sistema'
+      firma_digital: 'documentos',
+      correo: 'sistema'
     };
 
     return clases[modulo] || 'normal';

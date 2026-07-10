@@ -90,6 +90,9 @@
             <button type="button" class="new-btn" (click)="abrirNuevoFunc()">
               <i class="bi bi-person-plus-fill"></i> Nuevo
             </button>
+            <button type="button" class="new-btn new-btn--acceso" (click)="abrirNuevoUsuarioSistema()" title="Registra un funcionario y le crea de una vez un usuario con rol (Jefe inmediato, Máxima autoridad, TICS o Administrador)">
+              <i class="bi bi-shield-lock-fill"></i> Nuevo usuario del sistema
+            </button>
           </div>
         </div>
         <div class="loading" *ngIf="cargandoFunc">Cargando personal...</div>
@@ -335,15 +338,25 @@
 
       <!-- ── Acceso al sistema ─────────────────── -->
       <div class="acceso-section">
+        <p class="acceso-explicacion">
+          <i class="bi bi-info-circle-fill"></i>
+          ¿Este funcionario debe <strong>iniciar sesión</strong> y firmar como
+          <strong>Jefe inmediato</strong>, <strong>Máxima autoridad</strong> o <strong>Analista TICS</strong>?
+          Activa la siguiente opción para crearle un usuario y asignarle ese rol.
+        </p>
         <label class="acceso-toggle-label">
           <input type="checkbox" [(ngModel)]="formFunc.dar_acceso" name="fdarAcceso" (change)="formFunc.dar_acceso && !formFunc.usuario_nombre && generarUsuarioSugerido()" />
           <span class="acceso-toggle-text">
             <i class="bi bi-person-badge-fill"></i>
-            {{ modoEdFunc && formFunc.dar_acceso ? 'Tiene acceso al sistema' : 'Dar acceso al sistema' }}
+            {{ modoEdFunc && formFunc.dar_acceso ? 'Tiene acceso al sistema' : 'Dar acceso al sistema (crear usuario y rol)' }}
           </span>
         </label>
 
         <div class="acceso-fields" *ngIf="formFunc.dar_acceso">
+          <p class="acceso-fields-hint">
+            El <strong>rol del sistema</strong> es el que define qué puede firmar/aprobar esta persona
+            (Jefe inmediato, Máxima autoridad, Analista TICS o Administrador).
+          </p>
           <div class="form-grid">
             <label>Usuario *
               <div style="display:flex;gap:6px">

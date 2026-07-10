@@ -235,6 +235,12 @@ export class Funcionarios implements OnInit {
     this.modoEdFunc = false; this.mostrarModalFunc = true;
   }
 
+  /** Atajo: abre el mismo formulario de funcionario con la sección de acceso al sistema ya activada. */
+  abrirNuevoUsuarioSistema(): void {
+    this.abrirNuevoFunc();
+    this.formFunc.dar_acceso = true;
+  }
+
   abrirEditarFunc(f: Funcionario): void {
     this.formFunc = {
       id: f.id, nombres: f.nombres, apellidos: f.apellidos,

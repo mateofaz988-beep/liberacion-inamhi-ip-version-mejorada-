@@ -395,7 +395,8 @@ app.config["TEMP_CERTS_FOLDER"] = TEMP_CERTS_FOLDER
 
 def generar_codigo_solicitud() -> str | None:
     anio = datetime.datetime.now().year
-    prefijo = f"INAMHI-WEB-{anio}-"
+    prefijo = f"INAMHI-{anio}-"
+    sufijo = "AWE"
     conexion = get_db_connection()
     if conexion is None:
         return None
@@ -404,14 +405,14 @@ def generar_codigo_solicitud() -> str | None:
         cursor = conexion.cursor(dictionary=True)
         cursor.execute(
             "select codigo_solicitud from solicitudes where codigo_solicitud like %s order by id desc limit 1;",
-            (f"{prefijo}%",)
+            (f"{prefijo}%-{sufijo}",)
         )
         ultimo = cursor.fetchone()
         if ultimo is None:
             numero = 1
         else:
-            numero = int(ultimo["codigo_solicitud"].split("-")[-1]) + 1
-        return f"{prefijo}{str(numero).zfill(4)}"
+            numero = int(ultimo["codigo_solicitud"].split("-")[2]) + 1
+        return f"{prefijo}{str(numero).zfill(3)}-{sufijo}"
     except Exception as error:
         log.error("error al generar código: %s", error)
         return None
@@ -2810,7 +2811,7 @@ def subir_pdf_firmado_firmaec(codigo_solicitud):
             "mensaje": "el código de solicitud es obligatorio."
         }), 400
 
-    if not re.match(r"^INAMHI-WEB-\d{4}-\d{4}$", codigo_solicitud):
+    if not re.match(r"^(INAMHI-\d{4}-\d{3}-AWE|INAMHI-WEB-\d{4}-\d{4})$", codigo_solicitud):
         return jsonify({
             "estado": "error",
             "mensaje": "el código de solicitud no tiene un formato válido."
@@ -2963,8 +2964,33 @@ def subir_pdf_firmado_firmaec(codigo_solicitud):
 # flujo manual público
 # =====================================================
 
-def generar_uuid_manual():
-    return f"MAN-{uuid.uuid4().hex[:8].upper()}"
+def generar_uuid_manual() -> str | None:
+    anio = datetime.datetime.now().year
+    prefijo = f"INAMHI-{anio}-"
+    sufijo = "AWM"
+    conexion = get_db_connection()
+    if conexion is None:
+        return None
+    cursor = None
+    try:
+        cursor = conexion.cursor(dictionary=True)
+        cursor.execute(
+            "select uuid_solicitud from solicitudes_manual where uuid_solicitud like %s order by id desc limit 1;",
+            (f"{prefijo}%-{sufijo}",)
+        )
+        ultimo = cursor.fetchone()
+        if ultimo is None:
+            numero = 1
+        else:
+            numero = int(ultimo["uuid_solicitud"].split("-")[2]) + 1
+        return f"{prefijo}{str(numero).zfill(3)}-{sufijo}"
+    except Exception as error:
+        log.error("error al generar ID manual: %s", error)
+        return None
+    finally:
+        if cursor:
+            cursor.close()
+        conexion.close()
 
 
 def generar_pdf_manual_vacio(uuid_solicitud, nombres, apellidos, correo):
@@ -3088,6 +3114,13 @@ def registrar_solicitud_manual():
         }), 400
 
     uuid_solicitud = generar_uuid_manual()
+
+    if uuid_solicitud is None:
+        return jsonify({
+            "estado": "error",
+            "mensaje": "no se pudo generar el ID de la solicitud manual."
+        }), 500
+
     fecha_hora = datetime.datetime.now()
     fecha_registro = fecha_hora.date()
     hora_registro = fecha_hora.time().replace(microsecond=0)
@@ -3227,10 +3260,10 @@ def validar_solicitud_manual(uuid_solicitud):
             "mensaje": "el ID de solicitud manual es obligatorio."
         }), 400
 
-    if not re.match(r"^MAN-[A-Z0-9]{8}$", uuid_solicitud):
+    if not re.match(r"^(INAMHI-\d{4}-\d{3}-AWM|MAN-[A-Z0-9]{8})$", uuid_solicitud):
         return jsonify({
             "estado": "error",
-            "mensaje": "el ID manual no tiene un formato válido. ejemplo: MAN-65CA1D9A."
+            "mensaje": "el ID manual no tiene un formato válido. ejemplo: INAMHI-2026-001-AWM."
         }), 400
 
     conexion = get_db_connection()
@@ -3423,10 +3456,10 @@ def subir_documento_manual_firmado(uuid_solicitud):
             "mensaje": "el ID de solicitud manual es obligatorio."
         }), 400
 
-    if not re.match(r"^MAN-[A-Z0-9]{8}$", uuid_solicitud):
+    if not re.match(r"^(INAMHI-\d{4}-\d{3}-AWM|MAN-[A-Z0-9]{8})$", uuid_solicitud):
         return jsonify({
             "estado": "error",
-            "mensaje": "el ID manual no tiene un formato válido. ejemplo: MAN-65CA1D9A."
+            "mensaje": "el ID manual no tiene un formato válido. ejemplo: INAMHI-2026-001-AWM."
         }), 400
 
     if "archivo" not in request.files:
@@ -3762,10 +3795,10 @@ def descargar_documento_manual_firmado_admin(uuid_solicitud):
             "mensaje": "el ID de solicitud manual es obligatorio."
         }), 400
 
-    if not re.match(r"^MAN-[A-Z0-9]{8}$", uuid_solicitud):
+    if not re.match(r"^(INAMHI-\d{4}-\d{3}-AWM|MAN-[A-Z0-9]{8})$", uuid_solicitud):
         return jsonify({
             "estado": "error",
-            "mensaje": "el ID manual no tiene un formato válido. ejemplo: MAN-65CA1D9A."
+            "mensaje": "el ID manual no tiene un formato válido. ejemplo: INAMHI-2026-001-AWM."
         }), 400
 
     conexion = get_db_connection()
@@ -4016,7 +4049,7 @@ def descargar_pdf_actual_proceso_electronico_admin(codigo_solicitud):
             "mensaje": "el código de solicitud es obligatorio."
         }), 400
 
-    if not re.match(r"^INAMHI-WEB-\d{4}-\d{4}$", codigo_solicitud):
+    if not re.match(r"^(INAMHI-\d{4}-\d{3}-AWE|INAMHI-WEB-\d{4}-\d{4})$", codigo_solicitud):
         return jsonify({
             "estado": "error",
             "mensaje": "el código de solicitud no tiene un formato válido."
@@ -4585,6 +4618,29 @@ def subir_firma_electronica_y_generar_pdf(solicitud_id):
                 "mensaje": "la solicitud se encuentra bloqueada."
             }), 409
 
+        # El rol autenticado debe coincidir con el rol que corresponde a la
+        # etapa actual — de lo contrario cualquier usuario podría fabricar un
+        # documento "firmado" (firmado=1, firma_validada=1) para una etapa que
+        # no le pertenece con solo subir una imagen, sin certificado real.
+        mapa_etapa_rol = {
+            "jefe_inmediato":   "jefe_inmediato",
+            "maxima_autoridad": "maxima_autoridad",
+            "tics":             "analista_tics",
+            "ejecucion_tics":   "analista_tics"
+        }
+        rol_esperado = mapa_etapa_rol.get(solicitud["etapa_actual"])
+
+        if rol_actual != rol_esperado:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": f"no tiene permisos para firmar en esta etapa. Le corresponde al rol: {rol_esperado or 'ninguno'}.",
+                "rol_actual": rol_actual,
+                "etapa_actual": solicitud["etapa_actual"]
+            }), 403
+
                 # =====================================================
         # Crear nombres y rutas
         # =====================================================
@@ -4831,6 +4887,38 @@ def subir_documento_firmado(solicitud_id):
                 "estado": "error",
                 "mensaje": "solicitud no encontrada."
             }), 404
+
+        if solicitud["bloqueada"]:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": "la solicitud está bloqueada."
+            }), 409
+
+        # Este endpoint permite carga manual del administrador (comentario
+        # original del servicio frontend), pero cualquier otro rol solo puede
+        # subir el documento de SU propia etapa — evita que un rol distinto
+        # fabrique un documento "firmado" para una etapa que no le corresponde.
+        mapa_etapa_rol = {
+            "jefe_inmediato":   "jefe_inmediato",
+            "maxima_autoridad": "maxima_autoridad",
+            "tics":             "analista_tics",
+            "ejecucion_tics":   "analista_tics"
+        }
+        rol_esperado = mapa_etapa_rol.get(solicitud["etapa_actual"])
+
+        if rol_actual != "administrador" and rol_actual != rol_esperado:
+            cursor.close()
+            conexion.close()
+
+            return jsonify({
+                "estado": "error",
+                "mensaje": f"no tiene permisos para subir un documento en esta etapa. Le corresponde al rol: {rol_esperado or 'ninguno'}.",
+                "rol_actual": rol_actual,
+                "etapa_actual": solicitud["etapa_actual"]
+            }), 403
 
         nombre_seguro = secure_filename(nombre_archivo_param)
         extension = os.path.splitext(nombre_seguro)[1].lower() or ".pdf"
@@ -7889,7 +7977,7 @@ def descargar_pdf_publico_firmaec(codigo_solicitud):
             "mensaje": "el código de solicitud es obligatorio."
         }), 400
 
-    if not re.match(r"^INAMHI-WEB-\d{4}-\d{4}$", codigo_solicitud):
+    if not re.match(r"^(INAMHI-\d{4}-\d{3}-AWE|INAMHI-WEB-\d{4}-\d{4})$", codigo_solicitud):
         return jsonify({
             "estado": "error",
             "mensaje": "el código de solicitud no tiene un formato válido."
@@ -8418,7 +8506,7 @@ def subir_pdf_firmado_publico_firmaec(codigo_solicitud):
             "mensaje": "el código de solicitud es obligatorio."
         }), 400
 
-    if not re.match(r"^INAMHI-WEB-\d{4}-\d{4}$", codigo_solicitud):
+    if not re.match(r"^(INAMHI-\d{4}-\d{3}-AWE|INAMHI-WEB-\d{4}-\d{4})$", codigo_solicitud):
         return jsonify({
             "estado": "error",
             "mensaje": "el código de solicitud no tiene un formato válido."
@@ -9228,7 +9316,11 @@ def _encontrar_rect_firma(ruta_pdf, rol_firmante):
                     y_anchor = sec_rects[0].y0
                     break
 
-            # Detectar y del encabezado del rol para obtener la y de la fila de firma
+            # Detectar y del encabezado del rol para obtener la y de la fila de firma.
+            # Se toma la ocurrencia MÁS CERCANA al título de la sección (menor y0
+            # entre las que están debajo de él) — el texto de la columna (p.ej.
+            # "TICS") puede repetirse más abajo en el documento (otras secciones)
+            # y tomar la más lejana anclaba el sello fuera de la tabla de firmas.
             mejor_rect = None
             for txt in textos:
                 todas = page.search_for(txt)
@@ -9237,8 +9329,8 @@ def _encontrar_rect_firma(ruta_pdf, rol_firmante):
                 candidatos = [r for r in todas if r.y0 >= y_anchor]
                 if not candidatos:
                     candidatos = todas
-                mejor = max(candidatos, key=lambda r: r.y0)
-                if mejor_rect is None or mejor.y0 > mejor_rect.y0:
+                mejor = min(candidatos, key=lambda r: r.y0)
+                if mejor_rect is None or mejor.y0 < mejor_rect.y0:
                     mejor_rect = mejor
 
             if mejor_rect is None:
@@ -9469,10 +9561,37 @@ def firmar_pdf_con_pyhanko(solicitud_id):
     try:
         cursor = conexion.cursor(dictionary=True)
         cursor.execute("""
-            SELECT id, codigo_solicitud, estado, etapa_actual, bloqueada,
-                   nombres_completos, nombre_jefe_area, nombre_maxima_autoridad, nombre_encargado_tics
-            FROM solicitudes
-            WHERE id = %s
+            SELECT s.id, s.codigo_solicitud, s.estado, s.etapa_actual, s.bloqueada,
+                   s.nombres_completos,
+                   (
+                       SELECT CONCAT(p.nombres, ' ', IFNULL(p.apellidos, ''))
+                       FROM area_personal p
+                       WHERE p.area_id = s.area_id
+                         AND p.tipo_responsable = 'jefe_area'
+                         AND p.estado = 'activo'
+                       ORDER BY p.id ASC
+                       LIMIT 1
+                   ) AS nombre_jefe_area,
+                   (
+                       SELECT CONCAT(u.nombres, ' ', IFNULL(u.apellidos, ''))
+                       FROM usuarios u
+                       INNER JOIN roles r ON r.id = u.rol_id
+                       WHERE r.nombre = 'maxima_autoridad'
+                         AND u.estado = 'activo'
+                       ORDER BY u.id ASC
+                       LIMIT 1
+                   ) AS nombre_maxima_autoridad,
+                   (
+                       SELECT CONCAT(u.nombres, ' ', IFNULL(u.apellidos, ''))
+                       FROM usuarios u
+                       INNER JOIN roles r ON r.id = u.rol_id
+                       WHERE r.nombre = 'analista_tics'
+                         AND u.estado = 'activo'
+                       ORDER BY u.id ASC
+                       LIMIT 1
+                   ) AS nombre_encargado_tics
+            FROM solicitudes s
+            WHERE s.id = %s
             LIMIT 1
         """, (solicitud_id,))
         solicitud = cursor.fetchone()
@@ -10221,8 +10340,11 @@ def firmar_pyhanko_solicitante(codigo_solicitud):
             f"PDF firmado con pyHanko por solicitante. Cert: {info_cert['subject_cn']}"
         ))
 
-        # Obtener correo del jefe para notificación
-        correo_jefe = solicitud.get("correo_jefe_area") or ""
+        # correo_jefe y nombre_jefe ya se obtuvieron correctamente más arriba
+        # (vía jefe_asignado_id) — antes esta línea los sobrescribía leyendo
+        # una columna "correo_jefe_area" que no existe, dejando correo_jefe
+        # siempre en "" y por lo tanto el correo de notificación nunca se
+        # enviaba al jefe inmediato.
 
         # Avanzar estado a pendiente_jefe_inmediato
         cursor.execute("""
