@@ -99,7 +99,7 @@ El sistema sigue una arquitectura de **tres capas** desacopladas, desplegadas en
                   ┌────────▼────────┐
                   │   NGINX         │
                   │  Proxy Reverso  │
-                  │  10.0.153.69:80 │
+                  │  10.0.153.76:80 │
                   └───┬─────────────┘
                       │
           ┌───────────┴────────────┐
@@ -599,7 +599,7 @@ El backend mantiene logs operacionales en `backend/logs/`:
 
 | Parámetro | Valor |
 |-----------|-------|
-| IP del servidor | 10.0.153.69 |
+| IP del servidor | 10.0.153.76 |
 | Puerto público | 80 (HTTP) |
 | Puerto Flask interno | 5050 |
 | Puerto MySQL | 3306 (local) |
@@ -676,10 +676,10 @@ Toda la configuración sensible se gestiona mediante el archivo `backend/.env`, 
 
 | Variable | Descripción | Ejemplo |
 |----------|-------------|---------|
-| `APP_URL` | URL pública del backend | `http://10.0.153.69:5050` |
+| `APP_URL` | URL pública del backend | `http://10.0.153.76:5050` |
 | `BACKEND_HOST` | IP de escucha Flask | `0.0.0.0` |
 | `BACKEND_PORT` | Puerto de escucha Flask | `5050` |
-| `CORS_ORIGINS` | Orígenes CORS permitidos | `http://10.0.153.69` |
+| `CORS_ORIGINS` | Orígenes CORS permitidos | `http://10.0.153.76` |
 
 ### 12.4 Variables de Correo Electrónico
 

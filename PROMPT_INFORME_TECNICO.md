@@ -31,7 +31,7 @@ a la Información Pública del Ecuador).
 ## ARQUITECTURA
 
 - Arquitectura de 3 capas desacopladas
-- Servidor Linux único con Nginx como proxy inverso en IP 10.0.153.69:80
+- Servidor Linux único con Nginx como proxy inverso en IP 10.0.153.76:80
 - Frontend SPA Angular servido como archivos estáticos
 - Backend Flask en puerto 5050 (via Gunicorn + systemd)
 - Base de datos MySQL en puerto 3306
@@ -638,10 +638,10 @@ Compatible con Ley de Comercio Electrónico, Firmas y Mensajes de Datos — Ecua
 ### Servidor
 | Variable | Descripción | Ejemplo |
 |----------|-------------|---------|
-| APP_URL | URL pública backend | http://10.0.153.69:5050 |
+| APP_URL | URL pública backend | http://10.0.153.76:5050 |
 | BACKEND_HOST | IP de escucha | 0.0.0.0 |
 | BACKEND_PORT | Puerto Flask | 5050 |
-| CORS_ORIGINS | Orígenes permitidos | http://10.0.153.69 |
+| CORS_ORIGINS | Orígenes permitidos | http://10.0.153.76 |
 
 ### Email SMTP
 | Variable | Descripción |
@@ -662,7 +662,7 @@ Compatible con Ley de Comercio Electrónico, Firmas y Mensajes de Datos — Ecua
 ## DESPLIEGUE E INFRAESTRUCTURA
 
 ### Servidor de producción
-- IP: 10.0.153.69
+- IP: 10.0.153.76
 - Puerto público: 80
 - Puerto Flask interno: 5050
 - Puerto MySQL: 3306 (solo local)

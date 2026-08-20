@@ -54,6 +54,21 @@ def validar_url(url: str) -> bool:
     return parsed.scheme in ("http", "https") and bool(parsed.netloc)
 
 
+def normalizar_url_pagina(url: str) -> str:
+    """
+    Antepone 'https://' cuando el usuario escribe una página web sin
+    protocolo (ej. 'youtube.com' -> 'https://youtube.com'). No intenta
+    adivinar dominio/TLD (ej. 'youtube' se deja como 'https://youtube'),
+    porque adivinar mal ese dato produciría enlaces incorrectos.
+    """
+    url = limpiar_texto(url)
+    if not url:
+        return url
+    if re.match(r"^https?://", url, re.IGNORECASE):
+        return url
+    return f"https://{url}"
+
+
 def validar_fecha(fecha: str) -> bool:
     try:
         datetime.strptime(limpiar_texto(fecha), "%Y-%m-%d")

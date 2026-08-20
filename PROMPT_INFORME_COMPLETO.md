@@ -38,7 +38,7 @@ Arquitectura de 3 capas desacopladas en un servidor Linux único:
 INTERNET / RED INTERNA
          │ HTTP :80
     ┌────▼─────┐
-    │  NGINX   │  Proxy inverso — 10.0.153.69
+    │  NGINX   │  Proxy inverso — 10.0.153.76
     └──┬────┬──┘
        │    │
   ┌────▼─┐ ┌▼──────────────┐
@@ -110,7 +110,7 @@ liberacion-inamhi-ip-version-mejorada-/
     │
     ├── environments/         Configuración por entorno (development / production).
     │   ├── environment.ts    DEV: { production: false, apiUrl: 'http://localhost:5050/api' }
-    │   └── environment.prod.ts  PROD: { production: true, apiUrl: 'http://10.0.153.69/api' }
+    │   └── environment.prod.ts  PROD: { production: true, apiUrl: 'http://10.0.153.76/api' }
     │                         Angular CLI sustituye automáticamente el archivo según el build.
     │
     └── app/                  Módulo raíz de la aplicación Angular (standalone).
@@ -764,7 +764,7 @@ deploy/
 │                               Sube el dist/ al servidor Linux vía SCP/SSH.
 │
 ├── nginx.conf                Configuración Nginx de producción:
-│                               server_name 10.0.153.69; listen 80;
+│                               server_name 10.0.153.76; listen 80;
 │                               root /var/www/inamhi/frontend;
 │                               location / → try_files (SPA fallback a index.html)
 │                               location /api/ → proxy_pass :5050, timeout 120s, max 20MB
@@ -1212,7 +1212,7 @@ El backend determina el nuevo estado según el rol del JWT (`request.usuario_act
 
 | Parámetro | Valor |
 |-----------|-------|
-| IP del servidor | 10.0.153.69 |
+| IP del servidor | 10.0.153.76 |
 | Puerto público (Nginx) | 80 |
 | Puerto Flask interno | 5050 (solo localhost) |
 | Puerto MySQL | 3306 (solo localhost) |

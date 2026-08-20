@@ -1,7 +1,7 @@
 #!/bin/bash
 # =============================================================================
 #  INAMHI Liberación Web — Script de despliegue en Linux
-#  Servidor: 10.0.153.69
+#  Servidor: 10.0.153.76
 #  Ejecutar como root o con sudo desde el directorio raíz del proyecto:
 #    sudo bash deploy/deploy.sh
 # =============================================================================
@@ -154,8 +154,8 @@ echo "======================================================"
 echo "  Despliegue completado exitosamente"
 echo "======================================================"
 echo ""
-echo "  Frontend : http://10.0.153.69"
-echo "  API      : http://10.0.153.69:5050/api"
+echo "  Frontend : http://10.0.153.76"
+echo "  API      : http://10.0.153.76:5050/api"
 echo ""
 echo "  Estado del servicio backend:"
 systemctl status inamhi-backend --no-pager -l

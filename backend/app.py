@@ -114,7 +114,7 @@ from utils.helpers import (
     validar_solo_letras_espacios, validar_correo_general,
     validar_cedula_formato, validar_telefono_10_digitos,
     validar_ipv4, validar_url, validar_fecha, convertir_fecha,
-    validar_ruta_segura,
+    validar_ruta_segura, normalizar_url_pagina,
 )
 from utils.audit import registrar_auditoria
 from utils.logger import log
@@ -394,9 +394,10 @@ app.config["TEMP_CERTS_FOLDER"] = TEMP_CERTS_FOLDER
 
 
 def generar_codigo_solicitud() -> str | None:
+    # El año se toma de datetime.now() en cada llamada — se actualiza solo,
+    # no hay que tocar nada cuando cambie de 2026 a 2027.
     anio = datetime.datetime.now().year
-    prefijo = f"INAMHI-{anio}-"
-    sufijo = "AWE"
+    prefijo = f"INAMHI-DAF-UTICS-LWE-{anio}-"
     conexion = get_db_connection()
     if conexion is None:
         return None
@@ -405,14 +406,14 @@ def generar_codigo_solicitud() -> str | None:
         cursor = conexion.cursor(dictionary=True)
         cursor.execute(
             "select codigo_solicitud from solicitudes where codigo_solicitud like %s order by id desc limit 1;",
-            (f"{prefijo}%-{sufijo}",)
+            (f"{prefijo}%",)
         )
         ultimo = cursor.fetchone()
         if ultimo is None:
             numero = 1
         else:
-            numero = int(ultimo["codigo_solicitud"].split("-")[2]) + 1
-        return f"{prefijo}{str(numero).zfill(3)}-{sufijo}"
+            numero = int(ultimo["codigo_solicitud"].split("-")[-1]) + 1
+        return f"{prefijo}{str(numero).zfill(3)}"
     except Exception as error:
         log.error("error al generar código: %s", error)
         return None
@@ -552,10 +553,10 @@ def validar_solicitud_publica(data):
 
         for pagina in paginas_web:
             if isinstance(pagina, dict):
-                url = limpiar_texto(pagina.get("url_pagina"))
+                url = normalizar_url_pagina(pagina.get("url_pagina"))
                 descripcion = normalizar_espacios(pagina.get("descripcion"))
             else:
-                url = limpiar_texto(pagina)
+                url = normalizar_url_pagina(pagina)
                 descripcion = ""
 
             if url:
@@ -596,10 +597,10 @@ def validar_solicitud_publica(data):
     if isinstance(paginas_web, list):
         for pagina in paginas_web:
             if isinstance(pagina, dict):
-                url = limpiar_texto(pagina.get("url_pagina"))
+                url = normalizar_url_pagina(pagina.get("url_pagina"))
                 descripcion = normalizar_espacios(pagina.get("descripcion"))
             else:
-                url = limpiar_texto(pagina)
+                url = normalizar_url_pagina(pagina)
                 descripcion = ""
 
             if url:
@@ -2811,7 +2812,7 @@ def subir_pdf_firmado_firmaec(codigo_solicitud):
             "mensaje": "el código de solicitud es obligatorio."
         }), 400
 
-    if not re.match(r"^(INAMHI-\d{4}-\d{3}-AWE|INAMHI-WEB-\d{4}-\d{4})$", codigo_solicitud):
+    if not re.match(r"^(INAMHI-DAF-UTICS-LWE-\d{4}-\d{3}|INAMHI-\d{4}-\d{3}-AWE|INAMHI-WEB-\d{4}-\d{4})$", codigo_solicitud):
         return jsonify({
             "estado": "error",
             "mensaje": "el código de solicitud no tiene un formato válido."
@@ -2965,9 +2966,9 @@ def subir_pdf_firmado_firmaec(codigo_solicitud):
 # =====================================================
 
 def generar_uuid_manual() -> str | None:
+    # El año se toma de datetime.now() en cada llamada — se actualiza solo.
     anio = datetime.datetime.now().year
-    prefijo = f"INAMHI-{anio}-"
-    sufijo = "AWM"
+    prefijo = f"INAMHI-DAF-UTICS-LWM-{anio}-"
     conexion = get_db_connection()
     if conexion is None:
         return None
@@ -2976,14 +2977,14 @@ def generar_uuid_manual() -> str | None:
         cursor = conexion.cursor(dictionary=True)
         cursor.execute(
             "select uuid_solicitud from solicitudes_manual where uuid_solicitud like %s order by id desc limit 1;",
-            (f"{prefijo}%-{sufijo}",)
+            (f"{prefijo}%",)
         )
         ultimo = cursor.fetchone()
         if ultimo is None:
             numero = 1
         else:
-            numero = int(ultimo["uuid_solicitud"].split("-")[2]) + 1
-        return f"{prefijo}{str(numero).zfill(3)}-{sufijo}"
+            numero = int(ultimo["uuid_solicitud"].split("-")[-1]) + 1
+        return f"{prefijo}{str(numero).zfill(3)}"
     except Exception as error:
         log.error("error al generar ID manual: %s", error)
         return None
@@ -3260,10 +3261,10 @@ def validar_solicitud_manual(uuid_solicitud):
             "mensaje": "el ID de solicitud manual es obligatorio."
         }), 400
 
-    if not re.match(r"^(INAMHI-\d{4}-\d{3}-AWM|MAN-[A-Z0-9]{8})$", uuid_solicitud):
+    if not re.match(r"^(INAMHI-DAF-UTICS-LWM-\d{4}-\d{3}|INAMHI-\d{4}-\d{3}-AWM|MAN-[A-Z0-9]{8})$", uuid_solicitud):
         return jsonify({
             "estado": "error",
-            "mensaje": "el ID manual no tiene un formato válido. ejemplo: INAMHI-2026-001-AWM."
+            "mensaje": "el ID manual no tiene un formato válido. ejemplo: INAMHI-DAF-UTICS-LWM-2026-001."
         }), 400
 
     conexion = get_db_connection()
@@ -3456,10 +3457,10 @@ def subir_documento_manual_firmado(uuid_solicitud):
             "mensaje": "el ID de solicitud manual es obligatorio."
         }), 400
 
-    if not re.match(r"^(INAMHI-\d{4}-\d{3}-AWM|MAN-[A-Z0-9]{8})$", uuid_solicitud):
+    if not re.match(r"^(INAMHI-DAF-UTICS-LWM-\d{4}-\d{3}|INAMHI-\d{4}-\d{3}-AWM|MAN-[A-Z0-9]{8})$", uuid_solicitud):
         return jsonify({
             "estado": "error",
-            "mensaje": "el ID manual no tiene un formato válido. ejemplo: INAMHI-2026-001-AWM."
+            "mensaje": "el ID manual no tiene un formato válido. ejemplo: INAMHI-DAF-UTICS-LWM-2026-001."
         }), 400
 
     if "archivo" not in request.files:
@@ -3795,10 +3796,10 @@ def descargar_documento_manual_firmado_admin(uuid_solicitud):
             "mensaje": "el ID de solicitud manual es obligatorio."
         }), 400
 
-    if not re.match(r"^(INAMHI-\d{4}-\d{3}-AWM|MAN-[A-Z0-9]{8})$", uuid_solicitud):
+    if not re.match(r"^(INAMHI-DAF-UTICS-LWM-\d{4}-\d{3}|INAMHI-\d{4}-\d{3}-AWM|MAN-[A-Z0-9]{8})$", uuid_solicitud):
         return jsonify({
             "estado": "error",
-            "mensaje": "el ID manual no tiene un formato válido. ejemplo: INAMHI-2026-001-AWM."
+            "mensaje": "el ID manual no tiene un formato válido. ejemplo: INAMHI-DAF-UTICS-LWM-2026-001."
         }), 400
 
     conexion = get_db_connection()
@@ -4049,7 +4050,7 @@ def descargar_pdf_actual_proceso_electronico_admin(codigo_solicitud):
             "mensaje": "el código de solicitud es obligatorio."
         }), 400
 
-    if not re.match(r"^(INAMHI-\d{4}-\d{3}-AWE|INAMHI-WEB-\d{4}-\d{4})$", codigo_solicitud):
+    if not re.match(r"^(INAMHI-DAF-UTICS-LWE-\d{4}-\d{3}|INAMHI-\d{4}-\d{3}-AWE|INAMHI-WEB-\d{4}-\d{4})$", codigo_solicitud):
         return jsonify({
             "estado": "error",
             "mensaje": "el código de solicitud no tiene un formato válido."
@@ -7977,7 +7978,7 @@ def descargar_pdf_publico_firmaec(codigo_solicitud):
             "mensaje": "el código de solicitud es obligatorio."
         }), 400
 
-    if not re.match(r"^(INAMHI-\d{4}-\d{3}-AWE|INAMHI-WEB-\d{4}-\d{4})$", codigo_solicitud):
+    if not re.match(r"^(INAMHI-DAF-UTICS-LWE-\d{4}-\d{3}|INAMHI-\d{4}-\d{3}-AWE|INAMHI-WEB-\d{4}-\d{4})$", codigo_solicitud):
         return jsonify({
             "estado": "error",
             "mensaje": "el código de solicitud no tiene un formato válido."
@@ -8506,7 +8507,7 @@ def subir_pdf_firmado_publico_firmaec(codigo_solicitud):
             "mensaje": "el código de solicitud es obligatorio."
         }), 400
 
-    if not re.match(r"^(INAMHI-\d{4}-\d{3}-AWE|INAMHI-WEB-\d{4}-\d{4})$", codigo_solicitud):
+    if not re.match(r"^(INAMHI-DAF-UTICS-LWE-\d{4}-\d{3}|INAMHI-\d{4}-\d{3}-AWE|INAMHI-WEB-\d{4}-\d{4})$", codigo_solicitud):
         return jsonify({
             "estado": "error",
             "mensaje": "el código de solicitud no tiene un formato válido."
@@ -10220,19 +10221,18 @@ def firmar_pyhanko_solicitante(codigo_solicitud):
 
         solicitud_id = solicitud["id"]
 
-        # Obtener correo y nombre del jefe asignado
-        correo_jefe = ""
+        # Obtener nombre del jefe asignado (para personalizar el correo de
+        # confirmación al solicitante — no se le envía correo al jefe).
         nombre_jefe = "Jefe inmediato"
         jefe_asignado_id = solicitud.get("jefe_asignado_id")
         if jefe_asignado_id:
             cursor.execute("""
-                SELECT nombres, apellidos, correo
+                SELECT nombres, apellidos
                 FROM usuarios WHERE id = %s LIMIT 1
             """, (jefe_asignado_id,))
             jefe_usr = cursor.fetchone()
             if jefe_usr:
                 nombre_jefe = f"{jefe_usr.get('nombres','')} {jefe_usr.get('apellidos','')}".strip()
-                correo_jefe = jefe_usr.get("correo") or ""
 
         # Obtener datos completos para generar PDF
         solicitud_pdf, paginas_web, error_pdf = obtener_solicitud_completa_para_pdf(solicitud_id)
@@ -10381,16 +10381,17 @@ def firmar_pyhanko_solicitante(codigo_solicitud):
             ip=ip_cliente
         )
 
-        # Enviar notificación al jefe
+        # Enviar confirmación al SOLICITANTE (no se notifica por correo al
+        # jefe inmediato — a petición del negocio, esa notificación se quitó).
         correo_enviado = False
         error_correo = None
-        if correo_jefe:
+        correo_solicitante = solicitud.get("correo_institucional") or ""
+        if correo_solicitante:
             try:
                 cuerpo_txt = (
-                    f"Estimado/a {nombre_jefe},\n\n"
-                    f"El solicitante {solicitud['nombres_completos']} firmó electrónicamente su solicitud.\n"
-                    f"Código: {codigo_solicitud}\n\n"
-                    f"La solicitud está pendiente de su revisión y aprobación.\n\n"
+                    f"Estimado/a {solicitud['nombres_completos']},\n\n"
+                    f"Su solicitud {codigo_solicitud} fue firmada electrónicamente y enviada "
+                    f"a {nombre_jefe} (su jefe inmediato) para revisión y aprobación.\n\n"
                     f"Sistema INAMHI"
                 )
                 cuerpo_html = f"""
@@ -10399,22 +10400,22 @@ def firmar_pyhanko_solicitante(codigo_solicitud):
                             box-shadow:0 4px 20px rgba(0,0,0,0.08);overflow:hidden;">
                   <div style="background:linear-gradient(135deg,#1e40af,#2563eb);padding:28px 32px;text-align:center;">
                     {_logo_email_tag()}
-                    <h2 style="color:#fff;margin:0;font-size:20px;">Solicitud firmada electrónicamente</h2>
+                    <h2 style="color:#fff;margin:0;font-size:20px;">Solicitud enviada a su jefe inmediato</h2>
                   </div>
                   <div style="padding:28px 32px;">
-                    <p style="color:#334155;">Estimado/a <strong>{nombre_jefe}</strong>,</p>
-                    <p style="color:#334155;">El solicitante firmó digitalmente su solicitud y requiere su revisión:</p>
+                    <p style="color:#334155;">Estimado/a <strong>{solicitud['nombres_completos']}</strong>,</p>
+                    <p style="color:#334155;">Su solicitud fue firmada electrónicamente y ya está en camino de aprobación:</p>
                     <div style="background:#eff6ff;border-left:4px solid #2563eb;padding:16px;border-radius:8px;margin:16px 0;">
                       <p style="margin:0 0 6px;color:#1e40af;font-weight:700;">Código: {codigo_solicitud}</p>
-                      <p style="margin:0;color:#334155;">Solicitante: <strong>{solicitud['nombres_completos']}</strong></p>
+                      <p style="margin:0;color:#334155;">Enviada a: <strong>{nombre_jefe}</strong> (jefe inmediato)</p>
                     </div>
-                    <p style="color:#64748b;font-size:13px;">Ingrese al sistema para revisar y aprobar o rechazar la solicitud.</p>
+                    <p style="color:#64748b;font-size:13px;">Le notificaremos cuando haya novedades sobre su solicitud.</p>
                   </div>
                   <div style="background:#f1f5f9;padding:16px 32px;text-align:center;">
                     <p style="color:#94a3b8;font-size:12px;margin:0;">INAMHI — Sistema de Gestión de Solicitudes</p>
                   </div>
                 </div></body></html>"""
-                enviar_correo(correo_jefe, f"Nueva solicitud firmada — {codigo_solicitud}", cuerpo_txt, cuerpo_html)
+                enviar_correo(correo_solicitante, f"Solicitud enviada a su jefe inmediato — {codigo_solicitud}", cuerpo_txt, cuerpo_html)
                 correo_enviado = True
             except Exception as e_correo:
                 error_correo = str(e_correo)
@@ -10473,7 +10474,7 @@ _inicializar_tablas_firma()
 # =====================================================
 
 if __name__ == "__main__":
-    IP_RED = "10.0.5.120"
+    IP_RED = "10.0.153.76"
 
     # Inicializar pool de conexiones antes de servir requests
     init_db(app)

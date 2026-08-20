@@ -101,7 +101,7 @@ export class SeguimientoSolicitud {
       return;
     }
 
-    this.error = 'Código inválido. Use un código manual como INAMHI-2026-001-AWM o un código electrónico como INAMHI-2026-001-AWE.';
+    this.error = 'Código inválido. Use un código manual como INAMHI-DAF-UTICS-LWM-2026-001 o un código electrónico como INAMHI-DAF-UTICS-LWE-2026-001.';
   }
 
   private consultarManual(codigoManual: string): void {
@@ -159,13 +159,15 @@ export class SeguimientoSolicitud {
   }
 
   esCodigoManual(codigo: string): boolean {
-    // INAMHI-2026-001-AWM (formato nuevo) o MAN-65CA1D9A (formato anterior, sigue vigente)
-    return /^(INAMHI-\d{4}-\d{3}-AWM|MAN-[A-Z0-9]{8})$/.test(codigo);
+    // INAMHI-DAF-UTICS-LWM-2026-001 (formato actual) o formatos anteriores, que
+    // siguen vigentes para solicitudes ya existentes: INAMHI-2026-001-AWM / MAN-65CA1D9A
+    return /^(INAMHI-DAF-UTICS-LWM-\d{4}-\d{3}|INAMHI-\d{4}-\d{3}-AWM|MAN-[A-Z0-9]{8})$/.test(codigo);
   }
 
   esCodigoElectronico(codigo: string): boolean {
-    // INAMHI-2026-001-AWE (formato nuevo) o INAMHI-WEB-2026-0001 (formato anterior, sigue vigente)
-    return /^(INAMHI-\d{4}-\d{3}-AWE|INAMHI-WEB-\d{4}-\d{4})$/.test(codigo);
+    // INAMHI-DAF-UTICS-LWE-2026-001 (formato actual) o formatos anteriores, que
+    // siguen vigentes para solicitudes ya existentes: INAMHI-2026-001-AWE / INAMHI-WEB-2026-0001
+    return /^(INAMHI-DAF-UTICS-LWE-\d{4}-\d{3}|INAMHI-\d{4}-\d{3}-AWE|INAMHI-WEB-\d{4}-\d{4})$/.test(codigo);
   }
 
   seleccionarArchivoManual(event: Event): void {

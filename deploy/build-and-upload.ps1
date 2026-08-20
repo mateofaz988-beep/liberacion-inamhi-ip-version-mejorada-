@@ -5,7 +5,7 @@
 # =============================================================================
 
 param(
-    [string]$Server   = "10.0.153.69",
+    [string]$Server   = "10.0.153.76",
     [string]$User     = "root",
     [string]$RemotePath = "/tmp/inamhi-deploy"
 )
