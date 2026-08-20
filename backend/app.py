@@ -17,12 +17,12 @@ import datetime
 from functools import wraps
 from urllib.parse import urlparse
 
-from flask import Flask, jsonify, request, send_file
+from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 import fitz
 import base64
 
 from werkzeug.utils import secure_filename
-from werkzeug.exceptions import BadRequest
+from werkzeug.exceptions import BadRequest, NotFound
 from flask_cors import CORS
 from dotenv import load_dotenv
 
@@ -740,16 +740,52 @@ def actualizar_ultimo_acceso(usuario_id):
 
 
 # =====================================================
-# rutas de prueba
+# frontend angular (build de producción)
+# En despliegues sin Nginx delante (ver deploy/nginx.conf para la
+# alternativa recomendada), Flask sirve directamente el build de
+# Angular: "/" y cualquier ruta que no sea /api/... ni un archivo
+# estático existente devuelven index.html para que el router de
+# Angular (SPA) tome el control en el navegador.
 # =====================================================
+
+FRONTEND_DIST_FOLDER = os.path.join(
+    os.path.dirname(BASE_DIR), "dist", "sistema-liberacion-web", "browser"
+)
+
+
+def _servir_index_frontend():
+    ruta_index = os.path.join(FRONTEND_DIST_FOLDER, "index.html")
+    if not os.path.isfile(ruta_index):
+        # El frontend aún no se compiló (ej. entorno de desarrollo local
+        # donde el Angular corre aparte con "ng serve"). Se conserva el
+        # antiguo mensaje de estado para no romper ese flujo.
+        return jsonify({
+            "estado": "ok",
+            "mensaje": "backend inamhi liberación web funcionando correctamente. "
+                       "Frontend no compilado: ejecute 'npm run build' para servirlo desde aquí.",
+            "puerto": BACKEND_PORT
+        }), 200
+    return send_from_directory(FRONTEND_DIST_FOLDER, "index.html")
+
 
 @app.route("/", methods=["GET"])
 def inicio():
-    return jsonify({
-        "estado": "ok",
-        "mensaje": "backend inamhi liberación web funcionando correctamente",
-        "puerto": BACKEND_PORT
-    }), 200
+    return _servir_index_frontend()
+
+
+@app.route("/<path:ruta>", methods=["GET"])
+def servir_frontend(ruta):
+    # No enmascarar con el index.html rutas de API/subidas inexistentes:
+    # deben seguir devolviendo un 404 real, no un HTML 200 falso-positivo.
+    if ruta == "api" or ruta.startswith("api/") or ruta.startswith("uploads/"):
+        abort(404)
+
+    try:
+        # send_from_directory usa safe_join internamente: cualquier intento
+        # de escapar de FRONTEND_DIST_FOLDER (ej. "../") se rechaza solo.
+        return send_from_directory(FRONTEND_DIST_FOLDER, ruta)
+    except NotFound:
+        return _servir_index_frontend()
 
 
 @app.route("/api/test", methods=["GET"])
