@@ -9693,7 +9693,34 @@ def firmar_pdf_con_pyhanko(solicitud_id):
 
         # --- FIRMA CON PYHANKO (función centralizada) ---
         nombre_campo = f"Firma_{rol_firmante}_{timestamp}"
-        nombre_firmante_qr = f"{usuario_actual.get('nombres', '')} {usuario_actual.get('apellidos', '')}".strip()
+
+        # La identidad del firmante debe ser la del dueño del certificado .p12
+        # con el que se firma (igual que en el flujo del solicitante), no la
+        # de la cuenta con la que se inició sesión: dos personas distintas
+        # pueden compartir la misma cuenta/rol pero firmar cada una con su
+        # propio certificado, y el sello/QR debe reflejar a quien realmente
+        # firmó. Si el certificado no trae CN, se cae al nombre de la cuenta
+        # logueada (el JWT no lo trae — ver generar_token — así que se busca
+        # en la tabla usuarios) y, por último, al nombre oficial del cargo.
+        nombre_firmante_qr = normalizar_espacios(info_cert.get("subject_cn") or "")
+
+        if not nombre_firmante_qr:
+            cursor.execute("""
+                SELECT CONCAT(nombres, ' ', IFNULL(apellidos, '')) AS nombre_completo
+                FROM usuarios WHERE id = %s LIMIT 1
+            """, (usuario_id,))
+            fila_usuario_firmante = cursor.fetchone()
+            nombre_firmante_qr = normalizar_espacios(
+                (fila_usuario_firmante or {}).get("nombre_completo") or ""
+            )
+
+        if not nombre_firmante_qr:
+            nombre_firmante_qr = normalizar_espacios({
+                "jefe_inmediato":   solicitud.get("nombre_jefe_area"),
+                "maxima_autoridad": solicitud.get("nombre_maxima_autoridad"),
+                "analista_tics":    solicitud.get("nombre_encargado_tics"),
+            }.get(rol_firmante) or "")
+
         _fecha_qr = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S-05:00")
         url_qr_firma = (
             f"FIRMADO POR: {nombre_firmante_qr}\n"
@@ -10262,7 +10289,9 @@ def firmar_pyhanko_solicitante(codigo_solicitud):
 
         # --- FIRMA CON PYHANKO EN COLUMNA SOLICITANTE ---
         nombre_campo = f"Firma_solicitante_{timestamp}"
-        nombre_firmante_qr = info_cert.get("subject_cn", solicitud.get("nombres_completos", ""))
+        nombre_firmante_qr = normalizar_espacios(
+            info_cert.get("subject_cn") or solicitud.get("nombres_completos") or ""
+        )
         _fecha_qr = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S-05:00")
         url_qr_firma = (
             f"FIRMADO POR: {nombre_firmante_qr}\n"
